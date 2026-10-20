@@ -540,6 +540,9 @@ def build_usage_result(data: dict) -> dict | None:
 # differently (``lines.window_line``, the TUI's per-row switch-line tick) keys
 # on this constant, so the label is spelled in one place.
 FIVE_HOUR_LABEL = "5h"
+# Label of the account-wide 7-day window; per-model windows carry their
+# model's display name.
+SEVEN_DAY_LABEL = "7d"
 
 
 def relevant_windows(
@@ -560,7 +563,7 @@ def relevant_windows(
     if not isinstance(usage, dict):
         return []
     windows: list[tuple[str, float, str | None]] = []
-    for key, label in (("five_hour", FIVE_HOUR_LABEL), ("seven_day", "7d")):
+    for key, label in (("five_hour", FIVE_HOUR_LABEL), ("seven_day", SEVEN_DAY_LABEL)):
         window = usage.get(key)
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
             windows.append((label, float(window["pct"]), window.get("resets_at")))

@@ -1368,6 +1368,35 @@ class TestAutoScreen:
             assert fake_engine.instances[0].stopped is True
             assert fake_engine.instances[1].dry_run is False
 
+    async def test_go_live_while_auto_switch_is_off_stays_dry(
+        self, tmp_path, fake_engine, monkeypatch
+    ):
+        from claude_swap.exceptions import AutoSwitchDisabledError
+
+        class OffEngine(_FakeEngine):
+            def __init__(self, switcher, settings, on_event, *, dry_run=False, **kwargs):
+                if not dry_run:
+                    raise AutoSwitchDisabledError("Automatic switching is turned off.")
+                super().__init__(switcher, settings, on_event, dry_run=dry_run, **kwargs)
+
+        monkeypatch.setattr("claude_swap.tui.autoview.AutoSwitchEngine", OffEngine)
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("l")
+            await pilot.pause()
+            await pilot.press("y")
+            await settle(pilot)
+            assert [e.dry_run for e in fake_engine.instances] == [True, True]
+            assert fake_engine.instances[0].stopped is True
+            from textual.widgets import RichLog
+
+            log = app.screen.query_one("#event-log", RichLog)
+            assert any("turned off" in line.text for line in log.lines)
+
     async def test_back_stops_engine_and_restores_fetching(
         self, tmp_path, fake_engine
     ):

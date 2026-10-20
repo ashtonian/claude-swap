@@ -16,6 +16,7 @@ from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    RestartSettings,
     UiSettings,
     effective_settings,
     load_settings,
@@ -162,12 +163,19 @@ class TestSettingSpecs:
         assert by_section["autoswitch"] == {
             f.name for f in AutoSwitchSettings.__dataclass_fields__.values()
         }
+        assert by_section["restart"] == {
+            f.name for f in RestartSettings.__dataclass_fields__.values()
+        }
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(),
+            "restart": RestartSettings(),
+            "ui": UiSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 

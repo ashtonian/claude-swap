@@ -25,6 +25,14 @@ uv sync
 uv run cswap help
 ```
 
+### This fork
+
+Session restarts on switch, off-by-default auto-switching and switch triggers (below) live in this fork:
+
+```bash
+uv tool install git+https://github.com/ashtonian/claude-swap
+```
+
 ### Updating
 
 ```bash
@@ -78,14 +86,68 @@ cswap list
 
 Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts).
 
-**Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
+A switch closes your running Claude Code sessions, swaps the account, and reopens each one where it was, resumed — see [Restart sessions on switch](#restart-sessions-on-switch). `cswap switch --no-restart` (or `cswap config set restart.onSwitch false`) leaves them running instead: on Linux/Windows they pick the new account up on their next message, on macOS once the Keychain cache expires (about 30 seconds). See [Tips](#tips) for the per-platform details.
+
+### Restart sessions on switch
+
+Every switch — `cswap switch`, [`cswap auto`](#automatic-switching), the [menu bar](#menu-bar-macos) and the [TUI](#interactive-dashboard-tui) — restarts the Claude Code sessions running on this machine around it:
+
+1. **Close.** Each session closes as soon as it is idle. One that is working (in a turn, running a background shell, or waiting on a question) gets `restart.busyTimeoutSeconds` (default 120) to finish; then it is closed mid-turn, and on resume Claude Code re-runs the turn it was cut off in. `--close-busy` skips the wait; `restart.onBusyTimeout abort` calls the switch off instead (the sessions already closed reopen on the old account).
+2. **Switch.**
+3. **Reopen.** Each session is reopened — in its own terminal where it can be, otherwise in a new window — with `claude --resume <id>`, the options it was started with (`--model`, `--name`, `--remote-control`, ...), the Claude Code settings in its environment (`ANTHROPIC_*`, `CLAUDE_*`, `ENABLE_*`/`DISABLE_*`, proxies), and in its directory. The full conversation comes back: Claude Code's offer to resume a long, old conversation from a summary is skipped (`restart.resume ask` keeps it). A turn the close — or a rate limit — cut off is re-run (`restart.continueInterrupted`). Sessions reopen even when the switch fails. Background agents (`claude --bg`) are not closed first: once the switch lands, Claude Code's own `claude respawn` restarts them.
+
+```bash
+cswap sessions                  # what a switch would close and reopen, and what it leaves running (and why)
+cswap switch 2                  # close, switch, reopen
+cswap switch 2 --close-busy     # don't wait for working sessions
+cswap switch 2 --no-restart     # leave the sessions alone this time
+cswap reopen                    # reopen sessions a restart closed and never saw come back
+```
+
+<details>
+<summary>Which sessions, and how</summary>
+
+- **Every interactive CLI session, in any terminal**, comes back, by the first of these that works (`cswap sessions` shows which, per session):
+  1. **In place**, in a **tmux** pane, a **Muxy** terminal, an **iTerm2** session or a **Terminal.app** tab: the resume command is typed into the shell the session was started from, once that shell has the terminal back, with a leading space so shells that ignore space-led lines keep it out of history. It runs a one-shot launcher script that deletes itself. A session that was its tmux pane's own process (`tmux new-window claude`) gets the pane respawned.
+  2. **A new window in the same app**: the same tmux session, a new Muxy terminal in the same project (listed under *Existing Terminals*), a new iTerm2 or Terminal.app window — when the tab closed with the session, or the shell did not take the terminal back.
+  3. **A new window in `restart.fallback`** (default: Terminal.app on macOS, a tmux session named `cswap` elsewhere): sessions in a terminal cswap cannot type into — VS Code's or Cursor's integrated terminal, Ghostty, Warp, ... — and anything steps 1 and 2 could not take. `restart.fallback none` leaves those sessions running instead.
+- **Background agents** (`claude --bg`) restart through `claude respawn <job id>` after the switch.
+- **Left running, with the reason in `cswap sessions`:** sessions inside an app — the VS Code/Cursor extension panel, Claude Desktop, SDK scripts — which only that app can restart; sessions signed in with their own credentials (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, Bedrock/Vertex/Foundry — a switch does not reach them). They pick the new account up from the credential store as before. `cswap run` session-mode sessions run on their own account, so a switch neither touches nor lists them.
+- **A first prompt is not sent again.** `claude "fix the build"` reopens as `claude --resume <id>`: positional arguments are dropped, as are options that pick or start a conversation (`--continue`, `--resume`, `--session-id`, `--fork-session`, `--worktree`, ...). The option grammar comes from that `claude`'s own `--help`.
+- **Run from inside a session** (Claude Code's Bash tool, or `!cswap switch`), the switch would close the session running it. It hands over to a detached worker instead and returns at once; the session finishes its turn, then is closed and reopened with the rest. The worker logs to `relaunch/worker.log` in the backup directory and posts a macOS notification when done.
+- **macOS permissions:** typing into iTerm2 and Terminal.app uses Apple Events, so the first restart asks (System Settings → Privacy & Security → Automation) to let the app cswap runs from — your terminal, or the menu bar's Python — control iTerm2 or Terminal. Until that is allowed, those sessions reopen in a new window instead (new windows need no permission for Terminal.app).
+
+</details>
+
+<details>
+<summary>Troubleshooting</summary>
+
+- **"N session(s) still working ... the switch was called off"** — `restart.onBusyTimeout` is `abort`. Wait for the turns to end, re-run with `--close-busy`, or set it back to `close`.
+- **A session did not come back** — the switch reports it (`reopened 23 of 24`). Its terminal shows the typed ` sh .../relaunch/<id>.command` line and whatever went wrong there. Run `cswap reopen`, or `claude --resume <id>` in that terminal. `relaunch/plan.json` in the backup directory lists every session of the last restart with its state (`closed`, `reopened`, `failed`).
+- **"did not return to its shell"** — after the session exited, something else took the terminal (a wrapper that relaunches claude in a loop): cswap does not type into it. Start the session from an interactive shell.
+- **A session was left running** — `cswap sessions` says why.
+- **Sessions in iTerm2 or Terminal.app came back in new windows** — macOS has not allowed Automation of that app yet (see above), or the planning call to it timed out; the switch log says which.
+- **A session came back in a `cswap` tmux session** — that is the `restart.fallback` on Linux: `tmux attach -t cswap`.
+- **"Another switch is restarting sessions"** — one restart at a time; the other one is still waiting on working sessions.
+
+</details>
 
 ### Automatic switching
 
-Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working:
+Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working. Each switch [restarts the sessions](#restart-sessions-on-switch) like a manual one.
+
+Automatic switching is **off until you turn it on** — `cswap auto`, the menu bar's and the TUI's auto-switch refuse to switch while it is off; `--dry-run` always works:
+
+```bash
+cswap config set autoswitch.enabled true
+cswap config set autoswitch.triggers weekly   # optional: switch only on the weekly limits
+```
+
+`autoswitch.triggers` (or `cswap auto --triggers`) names what may set off a switch: `5h`, `7d`, `model` (the per-model weekly windows named by `autoswitch.model`), `weekly` (= `7d,model`), `failover` (the active account's usage stays unreadable), `consume-first` (that strategy's below-the-line move), or `all` (the default). A window outside it may sit over its line — even exhausted — and the engine waits for its reset, logging `no switch: trigger-off (5h 95% >= 90%; autoswitch.triggers is weekly)`.
 
 ```bash
 cswap auto                     # foreground loop, polls every 60s
+cswap auto --triggers weekly   # switch on the 7-day and per-model limits only
 cswap auto --threshold 80      # switch earlier
 cswap auto --weekly-threshold 97   # let the weekly window run higher before switching
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
@@ -186,6 +248,8 @@ This will update the stored credentials without creating a duplicate.
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
+cswap sessions                  # Sessions a switch restarts, and those it leaves running
+cswap reopen                    # Reopen sessions a restarting switch left closed
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
 cswap list --token-status       # Add source-labelled OAuth token diagnostics
@@ -214,8 +278,8 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 
 ## Tips
 
-- **Do you need to restart after switching?** Usually not. On **Linux and Windows**, credentials are stored in a file and Claude Code re-reads them whenever that file changes, so the new account takes effect on your next message — no restart needed. On **macOS**, credentials live in the Keychain, which Claude Code caches for about 30 seconds; a running session picks up the switch once that cache expires. Restart Claude Code (or close and reopen the VS Code extension tab) only if you want the change to apply instantly.
-- **Continuing sessions after switching:** You can keep using the same Claude Code session after switching — run `cswap switch` in any terminal and carry on. If you'd prefer a clean start, close and reopen Claude Code (or the VS Code extension tab) and use `--resume` to pick your previous session. Either way, the first message on the new account may use extra usage as its conversation cache rebuilds.
+- **Do you need to restart after switching?** cswap does it for the sessions it can reopen ([Restart sessions on switch](#restart-sessions-on-switch)). For the rest, usually not: on **Linux and Windows**, credentials are stored in a file and Claude Code re-reads them whenever that file changes, so the new account takes effect on your next message. On **macOS**, credentials live in the Keychain, which Claude Code caches for about 30 seconds; a running session picks up the switch once that cache expires. Restart Claude Code (or close and reopen the VS Code extension tab) only if you want the change to apply instantly.
+- **Continuing sessions after switching:** a restarted session is the same conversation, resumed. Either way, the first message on the new account may use extra usage as its conversation cache rebuilds.
 
 ## How it works
 
@@ -236,7 +300,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
-Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
+Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root. Session restarts keep their last plan (`plan.json` — each session's command line, carried settings and state; mode 0600), the detached worker's log (`worker.log`) and, briefly, one-shot launcher scripts (`<session id>.command`, mode 0700) in `relaunch/`.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
@@ -252,7 +316,7 @@ uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar
 cswap menubar
 ```
 
-Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / disable-enable / remove / refresh actions. Enable *Settings → Auto-switch accounts* to run the same engine as [`cswap auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on.
+Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / disable-enable / remove / refresh actions. Enable *Settings → Auto-switch accounts* to run the same engine as [`cswap auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on — and it needs `autoswitch.enabled` on too. Switches from the menu run in the background and [restart the sessions](#restart-sessions-on-switch); the notification says how many came back.
 
 **Keep it running without a terminal.** `cswap menubar` runs in the foreground, so the status item dies with the terminal that started it and does not come back after a reboot. `--install-service` hands it to launchd instead — starts at login, restarts on crash, no `.app` bundle:
 
@@ -288,6 +352,29 @@ cswap config path                         # where settings.json lives
 `cswap config --help` lists every key with its valid range and default. Hand-editing the file still works — `cswap config` is just a safer front door. `list` and `get` take `--json` for scripting.
 
 </details>
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `autoswitch.enabled` | bool | `false` | Allow automatic switching (`cswap auto`, menu bar, TUI). Off: a live engine refuses to start; `--dry-run` always works. |
+| `autoswitch.triggers` | list | all | What may set off an automatic switch: `5h`, `7d`, `model`, `weekly` (`7d,model`), `failover`, `consume-first`, `all`. |
+| `autoswitch.threshold` | float 50–99.9 | `90` | Switch line for the 5h window, and for every window while no weekly line is set. |
+| `autoswitch.weeklyThreshold` | float 50–99.9 | unset | Switch line for the 7d and per-model windows. |
+| `autoswitch.intervalSeconds` | float 15–3600 | `60` | Poll interval of the `cswap auto` loop. |
+| `autoswitch.cooldownSeconds` | float 0–86400 | `300` | Minimum time between proactive switches. |
+| `autoswitch.hysteresisPct` | float 0–50 | `10` | How much more headroom a target needs than the active account. |
+| `autoswitch.strategy` | `best` \| `consume-first` | `best` | How the target is picked. |
+| `autoswitch.includeApiKeyAccounts` | bool | `false` | Allow rotating onto API-key accounts (billed per token). |
+| `autoswitch.unhealthyTicks` | int 1–100 | `3` | Failed polls of the active account before it fails over. |
+| `autoswitch.model` | string | unset | Per-model weekly windows that also count (`Fable`, `Fable,Opus`, `all`). |
+| `restart.onSwitch` | bool | `true` | Close the running sessions around every switch and reopen them resumed. |
+| `restart.resume` | `full` \| `ask` | `full` | `full` resumes the whole conversation; `ask` keeps Claude Code's offer to resume from a summary. |
+| `restart.busyTimeoutSeconds` | float 0–3600 | `120` | How long working sessions get to finish their turn. |
+| `restart.onBusyTimeout` | `close` \| `abort` | `close` | Then close the ones still working, or call the switch off. |
+| `restart.continueInterrupted` | bool | `true` | Reopened sessions re-run a turn the close or a rate limit cut off. |
+| `restart.closeTimeoutSeconds` | float 1–300 | `15` | How long a session gets to exit after SIGTERM before SIGKILL. |
+| `restart.reopenTimeoutSeconds` | float 5–600 | `60` | How long a reopened session gets to come back before it is reported. |
+| `restart.fallback` | `auto` \| `terminal` \| `iterm` \| `tmux` \| `none` | `auto` | Where a session reopens when its own terminal cannot take it back: a new Terminal.app or iTerm2 window, a tmux session named `cswap`; `auto` = Terminal.app on macOS, tmux elsewhere; `none` leaves such sessions running. |
+| `ui.theme` | `dark` \| `light` \| `auto` | `auto` | Color theme; `auto` follows the terminal background. |
 
 ### Backup and migration
 

@@ -11,6 +11,7 @@ import shutil
 import threading
 import sys
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -336,6 +337,11 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
+        # Wraps every account switch once its refusals have passed: called
+        # with the switch itself, it closes the running Claude Code sessions,
+        # runs it, and reopens them (relaunch.SessionRestarter). None switches
+        # without touching the sessions.
+        self.around_switch: Callable[[Callable[[], dict]], dict] | None = None
         # (settings mtime, (threshold, weekly_threshold, models)) — see
         # _poll_policy_inputs.
         self._poll_inputs_cache: tuple[
@@ -5999,7 +6005,7 @@ class ClaudeAccountSwitcher:
         else:
             reason = "already-active"
             message = f"Already on Account-{to_ref['number']} ({to_ref['email']})"
-        return {
+        result = {
             "schemaVersion": SCHEMA_VERSION,
             "switched": switched,
             "from": from_ref,
@@ -6009,6 +6015,9 @@ class ClaudeAccountSwitcher:
             "message": message,
             "warnings": (extra_warnings or []) + op["warnings"],
         }
+        if "restart" in op:
+            result["restart"] = op["restart"]
+        return result
 
     def _switch_noop(
         self,
@@ -7032,6 +7041,37 @@ class ClaudeAccountSwitcher:
                 else self._prefetch_live_identity()
             )
 
+        restart = self.around_switch
+        if restart is None:
+            return self._activate(
+                target_account, emit_output, force_activate, provenance, warnings_out
+            )
+        return restart(
+            lambda: self._activate(
+                target_account,
+                emit_output,
+                force_activate,
+                provenance,
+                warnings_out,
+                restarting=True,
+            )
+        )
+
+    def _activate(
+        self,
+        target_account: str,
+        emit_output: bool,
+        force_activate: bool,
+        provenance: dict,
+        warnings_out: list[str],
+        *,
+        restarting: bool = False,
+    ) -> dict:
+        """The switch itself, once ``_perform_switch``'s refusals have passed:
+        under the locks, back up the outgoing login and activate the target;
+        then, unlocked, the display. ``restarting``: ``around_switch`` reopens
+        the sessions on the new account, so the follow-up says so instead of
+        advising a restart."""
         # Beyond cswap's own lock, hold Claude Code's advisory locks for the
         # whole mutation (including rollback paths): its token refresh runs
         # under ~/.claude.lock and re-reads credentials there — holding it
@@ -7240,7 +7280,7 @@ class ClaudeAccountSwitcher:
                         f"{accent('Activated')} Account-{target_account} ({target_email})"
                     )
                     print()
-                    self._print_switch_followup()
+                    self._print_switch_followup(restarting)
                     print()
                 self._replan_new_active(
                     target_account,
@@ -7506,7 +7546,7 @@ class ClaudeAccountSwitcher:
                 self._logger.warning(f"Post-switch usage display failed: {e!r}")
                 print(dimmed("  (usage display unavailable — run `cswap --list` to retry)"))
             print()
-            self._print_switch_followup()
+            self._print_switch_followup(restarting)
             print()
         self._replan_new_active(
             target_account,
@@ -7515,9 +7555,10 @@ class ClaudeAccountSwitcher:
         )
         return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
-    def _print_switch_followup(self) -> None:
+    def _print_switch_followup(self, restarting: bool = False) -> None:
         """Print the note after a successful switch, keyed to where the active
-        credential write actually landed.
+        credential write actually landed — or, ``restarting``, that the
+        sessions are being reopened on the new account.
 
         A restart is never required: Claude Code clears its cached OAuth token when
         ``.credentials.json`` changes (file storage — effective on the next message)
@@ -7526,6 +7567,9 @@ class ClaudeAccountSwitcher:
         The file line also covers macOS when the Keychain was unavailable and the
         switch fell back to the file.
         """
+        if restarting:
+            print(dimmed("Reopening the closed Claude Code sessions on the new account."))
+            return
         backend = self._last_active_credentials_backend
         if backend is None:
             # No write happened this run; fall back to the routing hint.

@@ -94,3 +94,26 @@ class MigrationIncomplete(ClaudeSwitchError):
     """
 
     pass
+
+
+class AutoSwitchDisabledError(ConfigError):
+    """Automatic switching is turned off (``autoswitch.enabled`` is false).
+
+    Raised when a live auto-switch engine is asked to start; a dry run, which
+    only reports what it would do, is always allowed.
+    """
+
+    pass
+
+
+class RestartBlockedError(SwitchError):
+    """Sessions could not be closed for a restarting switch.
+
+    Raised before anything is closed or switched: some sessions were still
+    working (a turn or a background shell in progress) when the wait ran out.
+    """
+
+    def __init__(self, message: str, busy: list | None = None):
+        super().__init__(message)
+        self.busy = busy or []
+

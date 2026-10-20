@@ -19,6 +19,7 @@ from textual.worker import WorkerState
 
 from claude_swap import printer
 from claude_swap.models import AccountsSnapshot
+from claude_swap.relaunch import restart_summary
 from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -274,7 +275,15 @@ class CswapApp(App):
             if payload.get("switched"):
                 to = payload.get("to") or {}
                 target = to.get("email") or f"account {to.get('number')}"
-                self.notify(f"Switched to {target}", title="Switch")
+                restart = payload.get("restart")
+                if restart is None:
+                    self.notify(f"Switched to {target}", title="Switch")
+                else:
+                    self.notify(
+                        f"Switched to {target}; {restart_summary(restart)}",
+                        title="Switch",
+                        severity="warning" if restart.get("failed") else "information",
+                    )
             else:
                 reason = str(payload.get("reason") or "no switch performed")
                 self.notify(reason, title="No switch", severity="warning")

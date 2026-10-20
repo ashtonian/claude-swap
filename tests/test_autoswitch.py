@@ -102,7 +102,8 @@ class EngineHarness:
             self.switcher.platform = Platform.LINUX
             self.switcher._setup_directories()
             self.switcher._init_sequence_file()
-        self.settings = AutoSwitchSettings(**settings_kwargs)
+        # A live engine: the off-by-default guard has tests of its own.
+        self.settings = AutoSwitchSettings(**{"enabled": True, **settings_kwargs})
         self.events: list = []
         self.clock = FakeClock()
         # Keep the usage store on the same fake clock as the engine so

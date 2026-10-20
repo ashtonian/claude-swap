@@ -30,6 +30,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEvent,
     pct_label,
 )
+from claude_swap.exceptions import AutoSwitchDisabledError
 from claude_swap.lines import binding_window
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
@@ -211,6 +212,8 @@ class AutoScreen(Screen):
             text.append(
                 f" · weekly {pct_label(self._settings.weekly_threshold)}%"
             )
+        if self._settings.triggers is not None:
+            text.append(f" · on {self._settings.triggers}")
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
@@ -219,12 +222,22 @@ class AutoScreen(Screen):
     # -- engine -------------------------------------------------------------
 
     def _start_engine(self, *, dry_run: bool) -> None:
-        engine = AutoSwitchEngine(
-            self.app.switcher,
-            self._settings,
-            self._emit_from_thread,
-            dry_run=dry_run,
-        )
+        try:
+            engine = AutoSwitchEngine(
+                self.app.switcher,
+                self._settings,
+                self._emit_from_thread,
+                dry_run=dry_run,
+            )
+        except AutoSwitchDisabledError as e:
+            self.query_one("#event-log", RichLog).write(
+                Text(
+                    f"— {e} —",
+                    style=Palette.from_theme(self.app.current_theme).sev_warn,
+                )
+            )
+            self._start_engine(dry_run=True)
+            return
         self._engine = engine
         self.run_worker(
             engine.run_loop,

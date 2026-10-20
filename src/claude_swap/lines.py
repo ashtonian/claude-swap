@@ -33,7 +33,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from claude_swap.oauth import FIVE_HOUR_LABEL
+from claude_swap.oauth import FIVE_HOUR_LABEL, SEVEN_DAY_LABEL
 
 
 def window_line(label: str, threshold: float, weekly_threshold: float | None) -> float:
@@ -43,6 +43,29 @@ def window_line(label: str, threshold: float, weekly_threshold: float | None) ->
     if weekly_threshold is None or label == FIVE_HOUR_LABEL:
         return threshold
     return weekly_threshold
+
+
+def window_trigger(label: str) -> str:
+    """The ``autoswitch.triggers`` name a window answers to: ``5h``, ``7d``,
+    or ``model`` for every per-model window."""
+    if label in (FIVE_HOUR_LABEL, SEVEN_DAY_LABEL):
+        return label
+    return "model"
+
+
+def windows_over_line(
+    windows: Iterable[tuple[str, float, str | None]],
+    threshold: float,
+    weekly_threshold: float | None = None,
+) -> list[tuple[str, float, float]]:
+    """``(label, pct, line)`` for each window at or over its own line, in
+    ``relevant_windows`` order; the same comparison as ``BindingWindow.over``."""
+    over = []
+    for label, pct, _ in windows:
+        line = window_line(label, threshold, weekly_threshold)
+        if pct >= line:
+            over.append((label, pct, line))
+    return over
 
 
 def line_headroom(pct: float, line: float, threshold: float) -> float:

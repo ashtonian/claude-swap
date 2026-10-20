@@ -43,7 +43,13 @@ class ClaudeSession:
     started_at: int  # epoch milliseconds
     kind: str  # "interactive", "bg", "daemon", "daemon-worker"
     entrypoint: str  # "cli", "claude-vscode", "claude-desktop", "sdk-cli", "mcp"
-    status: str | None = None  # "busy", "idle", "waiting"
+    # "busy" (in a turn), "shell" (turn over, a background shell still
+    # running), "waiting" (for an answer), "idle"; None from versions that
+    # do not report one.
+    status: str | None = None
+    name: str | None = None  # display name (--name, /rename)
+    proc_start: str | None = None  # claude's reading of its own start; see pid_matches_record
+    job_id: str | None = None  # a background session's id for `claude respawn`
 
 
 @dataclass
@@ -100,7 +106,7 @@ def _is_pid_alive_windows(pid: int) -> bool:
         return False
 
 
-def _ps(pid: int, *columns: str) -> str | None:
+def ps_columns(pid: int, *columns: str) -> str | None:
     """``ps -o`` ``columns`` for ``pid``, or None when unknowable.
 
     POSIX only, under ``LC_ALL=C TZ=UTC`` like claude's own reading. Windows
@@ -132,7 +138,7 @@ def process_started_at(pid: int) -> int | None:
     lstart=`` under ``LC_ALL=C TZ=UTC``, so the two agree to the second for
     the same process.
     """
-    text = _ps(pid, "lstart")
+    text = ps_columns(pid, "lstart")
     if text is None:
         return None
     try:
@@ -184,7 +190,7 @@ def process_is_claude(pid: int) -> bool | None:
     it are named ``claude``, and an npm install runs ``cli.js`` out of a
     ``claude-code`` package directory.
     """
-    text = _ps(pid, "comm", "args")
+    text = ps_columns(pid, "comm", "args")
     if text is None:
         return None
     return "claude" in text.lower()
@@ -272,6 +278,9 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
                 kind=data.get("kind", ""),
                 entrypoint=data.get("entrypoint", ""),
                 status=data.get("status"),
+                name=data["name"] if isinstance(data.get("name"), str) and data["name"] else None,
+                proc_start=data.get("procStart"),
+                job_id=data["jobId"] if isinstance(data.get("jobId"), str) and data["jobId"] else None,
             ))
         except (
             json.JSONDecodeError,   # malformed JSON

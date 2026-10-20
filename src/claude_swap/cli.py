@@ -9,7 +9,7 @@ import os
 import sys
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 from claude_swap.json_output import error_envelope
 from claude_swap.models import ACCOUNT_THRESHOLD_MAX, ACCOUNT_THRESHOLD_MIN
 from claude_swap.printer import (
@@ -21,6 +21,7 @@ from claude_swap.printer import (
     muted,
     warning,
 )
+from claude_swap.relaunch import WORKER_ENV, notify
 from claude_swap.settings import load_ui_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -718,6 +719,7 @@ Examples:
   cswap auto --threshold 80        # switch earlier
   cswap auto --weekly-threshold 97 # let the weekly window run higher before switching
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
+  cswap auto --triggers weekly     # switch only on the 7d and per-model limits
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
@@ -778,6 +780,16 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--triggers",
+        type=_triggers_arg,
+        metavar="NAMES",
+        help=(
+            "Only these may set off a switch, comma-separated: 5h, 7d, model "
+            "(the --model windows), weekly (7d,model), failover (usage "
+            "unreadable), consume-first, or all (default: all)"
+        ),
+    )
+    parser.add_argument(
         "--include-api-key-accounts",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -794,6 +806,15 @@ Defaults live in settings.json in the backup root; flags override them.
             "Target selection: 'best' (most quota left; default) or "
             "'consume-first' (proactively use the account whose weekly window "
             "resets soonest)"
+        ),
+    )
+    parser.add_argument(
+        "--restart",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Close the running Claude Code sessions around each switch and "
+            "reopen them resumed (default: the restart.onSwitch setting)"
         ),
     )
     parser.add_argument(
@@ -834,6 +855,14 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        if not args.dry_run:
+            from claude_swap.relaunch import restarter_for
+
+            switcher.around_switch = restarter_for(
+                switcher.backup_dir,
+                enabled=args.restart,
+                progress=None if args.json else _restart_progress(False),
+            )
         engine = AutoSwitchEngine(
             switcher,
             settings,
@@ -852,10 +881,13 @@ Defaults live in settings.json in the backup root; flags override them.
                 if settings.weekly_threshold is not None
                 else ""
             )
+            triggers = (
+                f", on {settings.triggers}" if settings.triggers is not None else ""
+            )
             print(
                 dimmed(
                     f"Auto-switch running: threshold {pct_label(settings.threshold)}%"
-                    f"{weekly}, every {settings.interval_seconds:.0f}s"
+                    f"{weekly}{triggers}, every {settings.interval_seconds:.0f}s"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )
@@ -872,6 +904,17 @@ Defaults live in settings.json in the backup root; flags override them.
             file=sys.stderr if args.json else sys.stdout,
         )
         sys.exit(130)
+
+
+def _triggers_arg(value: str) -> str:
+    """argparse type for ``--triggers``: the same strict check as ``cswap
+    config set autoswitch.triggers``."""
+    from claude_swap.settings import SETTING_SPECS, parse_setting_value
+
+    try:
+        return parse_setting_value(SETTING_SPECS["autoswitch.triggers"], value)
+    except ConfigError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
 
 
 def _config_command(argv: list[str]) -> None:
@@ -913,6 +956,9 @@ Examples:
   cswap config get autoswitch.threshold
   cswap config set autoswitch.threshold 80
   cswap config set autoswitch.weeklyThreshold 97  # own line for the 7d/per-model windows
+  cswap config set autoswitch.enabled true  # allow automatic switching (off by default)
+  cswap config set autoswitch.triggers weekly  # ...only on the 7d and per-model limits
+  cswap config set restart.onSwitch false   # switches leave running sessions alone
   cswap config unset autoswitch.threshold   # back to the default
   cswap config path                         # where settings.json lives
         """,
@@ -1103,6 +1149,198 @@ def _menubar_service(args) -> int:
     return 0
 
 
+def _restart_progress(json_mode: bool):
+    """Progress lines for a restarting switch: dimmed on stdout, or on
+    stderr in JSON mode so stdout stays one JSON document."""
+
+    def emit(line: str) -> None:
+        print(dimmed(line), file=sys.stderr if json_mode else sys.stdout, flush=True)
+
+    return emit
+
+
+def _install_restart(switcher: ClaudeAccountSwitcher, args):
+    """Install the session restart the settings and flags ask for on
+    ``switcher``; returns it, or None when this switch leaves sessions
+    alone."""
+    from claude_swap.relaunch import restarter_for
+
+    restarter = restarter_for(
+        switcher.backup_dir,
+        enabled=args.restart,
+        close_busy=args.close_busy,
+        progress=_restart_progress(args.json),
+    )
+    switcher.around_switch = restarter
+    return restarter
+
+
+def _detach_restart(restarter, args) -> bool:
+    """Run the switch in a detached worker when this command runs inside a
+    session the switch would close: closing it would end this process
+    halfway. True when the worker took over and this command is done.
+
+    The worker re-runs the same command line, waits for this process to
+    exit (the session then finishes its turn, and is closed and reopened
+    with the rest), and posts a macOS notification when done.
+    """
+    from claude_swap.relaunch import (
+        WORKER_LOG_FILENAME,
+        spawn_worker,
+        wait_for_launcher,
+    )
+
+    if os.environ.get(WORKER_ENV):
+        wait_for_launcher(timeout=60.0)
+        return False
+    hosting = restarter.plan().hosting
+    if not hosting:
+        return False
+    log_path = restarter.state_dir / WORKER_LOG_FILENAME
+    pid = spawn_worker(sys.argv[1:], log_path)
+    message = (
+        f"This command runs inside {hosting[0].label}, which the switch "
+        f"restarts, so it continues in the background (pid {pid}): it waits "
+        "for this session's turn to end, closes the sessions, switches, and "
+        "reopens them. A notification follows."
+    )
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "switched": False,
+                    "pending": True,
+                    "reason": "restarting-in-background",
+                    "message": message,
+                    "workerPid": pid,
+                    "log": str(log_path),
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(message)
+        print(dimmed(f"Log: {log_path}"))
+    return True
+
+
+def _notify_restart_done(switcher: ClaudeAccountSwitcher, restarter) -> None:
+    """A detached worker's closing notification."""
+    current = switcher.current_account_number()
+    email = switcher.account_email(current) if current else ""
+    from claude_swap.relaunch import restart_summary
+
+    report = restarter.last_report
+    detail = f"Account-{current} ({email})" if current else "the switch is done"
+    if report is not None:
+        detail += f" · {restart_summary(report.to_json())}"
+    notify("claude-swap: switched", detail)
+
+
+def _sessions_command(argv: list[str]) -> None:
+    """Handle `cswap sessions [--json]`: what a restarting switch would
+    close and reopen, and what it would leave running and why."""
+    from claude_swap.relaunch import fallback_kind, plan_restart
+    from claude_swap.settings import load_restart_settings
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} sessions",
+        description=(
+            "Show the running Claude Code sessions a switch closes and reopens "
+            "(restart.onSwitch), and those it leaves running."
+        ),
+    )
+    parser.add_argument("--json", action="store_true", help="Emit JSON to stdout")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        settings = load_restart_settings(switcher.backup_dir)
+        plan = plan_restart(fallback=settings.fallback)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps({"schemaVersion": 1, "onSwitch": settings.on_switch, **plan.to_json()}, indent=2))
+        return
+
+    state = "on" if settings.on_switch else "off (cswap switch --restart turns it on once)"
+    print(dimmed(f"Restart on switch: {state}"))
+    if plan.sessions:
+        fallback = {"terminal": "Terminal.app", "iterm": "iTerm2", "tmux": "tmux"}.get(
+            fallback_kind(settings.fallback) or ""
+        )
+        print(f"A switch closes and reopens {len(plan.sessions)} session(s):")
+        rows = [
+            (s.label, s.status or "-", s.where, s.reopens_in(fallback), s.directory)
+            for s in plan.sessions
+        ]
+        widths = [max(len(row[i]) for row in rows) for i in range(4)]
+        print(dimmed("  " + "  ".join(
+            h.ljust(w) for h, w in zip(("SESSION", "STATUS", "RUNS IN", "REOPENS"), widths)
+        ) + "  DIRECTORY"))
+        for row in rows:
+            print("  " + "  ".join(c.ljust(w) for c, w in zip(row, widths)) + "  " + row[4])
+    else:
+        print("A switch has no session to close and reopen.")
+    left = [(s.label, "this command runs inside it") for s in plan.hosting]
+    left += [(s.label, s.reason) for s in plan.skipped]
+    if left:
+        print("Left running:")
+        for label, reason in left:
+            print(f"  {label}: {muted(reason)}")
+    if plan.unreadable:
+        print(muted(f"{plan.unreadable} session record(s) could not be read"))
+
+
+def _reopen_command(argv: list[str]) -> None:
+    """Handle `cswap reopen [--json]`: reopen the sessions the last
+    restarting switch closed and never saw come back."""
+    from claude_swap.relaunch import STATE_DIRNAME, SessionRestarter
+    from claude_swap.settings import load_restart_settings
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} reopen",
+        description=(
+            "Reopen the Claude Code sessions the last restarting switch closed "
+            "and could not confirm reopened (it was interrupted, or a terminal "
+            "did not take the command). Sessions running again are left alone."
+        ),
+    )
+    parser.add_argument("--json", action="store_true", help="Emit JSON to stdout")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        restarter = SessionRestarter(
+            switcher.backup_dir / STATE_DIRNAME,
+            load_restart_settings(switcher.backup_dir),
+            progress=_restart_progress(args.json),
+        )
+        report = restarter.reopen_unfinished()
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps({"schemaVersion": 1, **report.to_json()}, indent=2))
+    elif not report.reopened and not report.failed:
+        print("Nothing to reopen.")
+    for line in report.warnings():
+        if not args.json:
+            warning(line)
+    sys.exit(1 if report.failed else 0)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -1150,6 +1388,12 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+    if argv and argv[0] == "sessions":
+        _sessions_command(argv[1:])
+        return
+    if argv and argv[0] == "reopen":
+        _reopen_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -1173,6 +1417,8 @@ Commands:
   %(prog)s status                     show current account
   %(prog)s switch                     rotate to the next account
   %(prog)s switch <num|email>         switch to a specific account
+  %(prog)s sessions                   show which Claude Code sessions a switch restarts
+  %(prog)s reopen                     reopen sessions a restarting switch left closed
   %(prog)s add                        add the current account
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
   %(prog)s remove <num|email>         remove an account
@@ -1210,6 +1456,8 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s switch --strategy best           # pick the account with most quota left
   %(prog)s switch --strategy next-available # rotate, skipping rate-limited accounts
   %(prog)s switch user@example.com
+  %(prog)s switch 2 --no-restart            # leave the running sessions alone
+  %(prog)s switch 2 --close-busy            # close working sessions without waiting
   %(prog)s list --token-status
   %(prog)s list --json
   %(prog)s import-usage usage.json --hold 600  # adopt another machine's list --json
@@ -1264,6 +1512,23 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "With 'switch --strategy': also count these models' per-model "
             "weekly limits when comparing accounts (comma-separated display "
             "names, or 'all'). Defaults to the autoswitch.model setting"
+        ),
+    )
+    parser.add_argument(
+        "--restart",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "With 'switch': close the running Claude Code sessions, switch, "
+            "and reopen them resumed (default: the restart.onSwitch setting)"
+        ),
+    )
+    parser.add_argument(
+        "--close-busy",
+        action="store_true",
+        help=(
+            "With 'switch': close sessions in the middle of a turn at once "
+            "instead of waiting for it to end (the turn re-runs on resume)"
         ),
     )
     parser.add_argument(
@@ -1482,6 +1747,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "'switch --strategy next-available'"
         )
 
+    if (args.restart is not None or args.close_busy) and not (args.switch or args.switch_to):
+        parser.error("--restart, --no-restart and --close-busy can only be used with 'switch'")
+
+    if args.close_busy and args.restart is False:
+        parser.error("--close-busy closes sessions for a restart; drop --no-restart")
+
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
@@ -1541,6 +1812,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 error("Error: Do not run this script as root (unless running in a container)")
                 sys.exit(1)
 
+        restarter = None
+        if args.switch or args.switch_to:
+            restarter = _install_restart(switcher, args)
+            if restarter is not None and _detach_restart(restarter, args):
+                return
+
         if args.add_account:
             switcher.add_account(slot=args.slot, alias=args.alias)
         elif args.add_token is not None:
@@ -1586,6 +1863,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             payload = switcher.switch_to(
                 args.switch_to, json_output=args.json, force=args.force
             )
+        if restarter is not None and restarter.last_report is not None and not args.json:
+            from claude_swap.relaunch import restart_summary
+
+            print(dimmed(f"Claude Code sessions: {restart_summary(restarter.last_report.to_json())}"))
+        if restarter is not None and os.environ.get(WORKER_ENV):
+            _notify_restart_done(switcher, restarter)
         elif args.status:
             payload = switcher.status(json_output=args.json)
         elif args.purge:
@@ -1622,6 +1905,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
             sys.exit(menubar_run(switcher))
     except ClaudeSwitchError as e:
+        if os.environ.get(WORKER_ENV) and (args.switch or args.switch_to):
+            notify("claude-swap: switch failed", str(e))
         # In JSON mode keep stdout pure JSON: emit the structured error envelope
         # there (exit 1) instead of a red stderr line.
         if args.json:

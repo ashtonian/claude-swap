@@ -21,7 +21,12 @@ def run(switcher: "ClaudeAccountSwitcher", start: str = "dashboard") -> int:
     live watch page, stacked over the dashboard.
     """
     from claude_swap.appearance import detect_terminal_background, drain_stdin
+    from claude_swap.relaunch import restarter_for
     from claude_swap.tui.app import CswapApp
+
+    # Every switch from the TUI — its own and its auto screen's engine —
+    # restarts the sessions when restart.onSwitch asks for it.
+    switcher.around_switch = restarter_for(switcher.backup_dir)
 
     # Sense the terminal background while we still own stdin in cooked mode
     # (Textual's driver starts inside app.run()). Always detect so cycling to

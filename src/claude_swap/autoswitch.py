@@ -50,16 +50,28 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import AutoSwitchDisabledError, ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
-from claude_swap.lines import BindingWindow, binding_window, window_line
+from claude_swap.lines import (
+    BindingWindow,
+    binding_window,
+    window_line,
+    window_trigger,
+    windows_over_line,
+)
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.relaunch import restart_summary
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    parse_model_names,
+    parse_triggers,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -409,15 +421,21 @@ class SwitchEvent(AutoSwitchEvent):
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
     dry_run: bool = False
+    # The session restart around the switch (relaunch.RestartReport.to_json),
+    # when the switcher has one installed.
+    restart: dict | None = None
 
     def _fields(self) -> dict:
-        return {
+        fields = {
             "trigger": self.trigger,
             "from": self.from_ref,
             "to": self.to_ref,
             "warnings": self.warnings,
             "dryRun": self.dry_run,
         }
+        if self.restart is not None:
+            fields["restart"] = self.restart
+        return fields
 
     def human(self) -> str:
         src = (
@@ -429,7 +447,10 @@ class SwitchEvent(AutoSwitchEvent):
             else "?"
         )
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
-        return f"{prefix} {src} -> {dst} ({self.trigger})"
+        line = f"{prefix} {src} -> {dst} ({self.trigger})"
+        if self.restart is not None:
+            line += f"; {restart_summary(self.restart)}"
+        return line
 
 
 @dataclass(frozen=True)
@@ -731,6 +752,12 @@ class AutoSwitchEngine:
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
     ):
+        if not dry_run and not settings.enabled:
+            raise AutoSwitchDisabledError(
+                "Automatic switching is turned off. Turn it on with "
+                "`cswap config set autoswitch.enabled true`, or add --dry-run "
+                "to watch what it would do without switching."
+            )
         self.switcher = switcher
         self.settings = settings
         # Model(s) whose per-model weekly limit also binds the switch decision
@@ -774,6 +801,7 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        self._triggers_checked = False
 
     # -- state file ---------------------------------------------------------
 
@@ -1145,6 +1173,8 @@ class AutoSwitchEngine:
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
+        if not self._triggers_checked:
+            self._check_triggers(settings)
 
         if (
             self.switcher.account_kind_for(current) == "api_key"
@@ -1244,6 +1274,13 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.NO_ACTION
             trigger = "failover"
+
+        refusal = self._trigger_refusal(
+            trigger, usage.get(current), settings, thresholds[current]
+        )
+        if refusal is not None:
+            self._emit(NoSwitchEvent(reason="trigger-off", detail=refusal))
+            return TickOutcome.NO_ACTION
 
         if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
@@ -2486,11 +2523,45 @@ class AutoSwitchEngine:
                 from_ref=result.get("from"),
                 to_ref=result.get("to"),
                 warnings=result.get("warnings", []),
+                restart=result.get("restart"),
             )
         )
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
+
+    def _trigger_refusal(
+        self,
+        trigger: str,
+        value: dict | str | None,
+        settings: AutoSwitchSettings,
+        line: float,
+    ) -> str | None:
+        """Why ``autoswitch.triggers`` holds this switch back, or None when it
+        may go ahead. ``proactive`` and ``at-limit`` are window triggers: they
+        go ahead when a window over its line is one the setting names, so a
+        5h window over its line moves nothing under "weekly" even while a
+        weekly window is close. ``failover`` and ``consume-first`` are named
+        directly."""
+        allowed = parse_triggers(settings.triggers)
+        if trigger in ("failover", "consume-first"):
+            if trigger in allowed:
+                return None
+            return f"{trigger} is not in autoswitch.triggers ({settings.triggers})"
+        over = windows_over_line(
+            oauth.relevant_windows(
+                value if isinstance(value, dict) else None, self._models
+            ),
+            line,
+            settings.weekly_threshold,
+        )
+        if any(window_trigger(label) in allowed for label, _, _ in over):
+            return None
+        crossed = ", ".join(
+            f"{label} {pct_label(pct)}% >= {pct_label(limit)}%"
+            for label, pct, limit in over
+        )
+        return f"{crossed}; autoswitch.triggers is {settings.triggers}"
 
     def _binding(
         self, value: dict | str | None, settings: AutoSwitchSettings, line: float
@@ -2515,6 +2586,23 @@ class AutoSwitchEngine:
         if not isinstance(last, (int, float)):
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
+
+    def _check_triggers(self, settings: AutoSwitchSettings) -> None:
+        """One-shot guard: ``model`` in ``autoswitch.triggers`` watches the
+        per-model windows ``autoswitch.model`` names, so with none named it
+        allows nothing."""
+        self._triggers_checked = True
+        allowed = parse_triggers(settings.triggers)
+        if "model" in allowed and settings.triggers is not None and not self._models:
+            self._emit(
+                ConfigWarningEvent(
+                    message=(
+                        "autoswitch.triggers names per-model windows but "
+                        "autoswitch.model is unset, so no per-model window is "
+                        "watched; set autoswitch.model (e.g. Fable or all)"
+                    )
+                )
+            )
 
     def _check_model_names(
         self, quarantined: set[str], usage: dict[str, dict | str | None]

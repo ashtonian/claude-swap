@@ -717,6 +717,32 @@ def sample_sequence_data_with_org():
 
 
 @pytest.fixture(autouse=True)
+def block_session_restart(request, monkeypatch):
+    """Safety net: no test closes or reopens real Claude Code sessions.
+
+    ``restart.onSwitch`` defaults on, so every switch a test drives would
+    otherwise install ``relaunch.SessionRestarter``: it signals the pids in
+    session records and types into terminals, and when the switching process
+    runs inside a session (this suite run from Claude Code) it re-runs the
+    command line as a detached worker — a real switch outside the test.
+    Switches leave sessions alone (``restarter_for`` answers None) and
+    ``spawn_worker`` fails, unless the test is marked
+    ``@pytest.mark.session_restart``; those tests inject their own process
+    and terminal fakes.
+    """
+    if request.node.get_closest_marker("session_restart"):
+        yield
+        return
+
+    def no_worker(*_args, **_kwargs):
+        raise AssertionError("a test tried to spawn a detached restart worker")
+
+    monkeypatch.setattr("claude_swap.relaunch.restarter_for", lambda *a, **k: None)
+    monkeypatch.setattr("claude_swap.relaunch.spawn_worker", no_worker)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _deterministic_poll_jitter(monkeypatch):
     """Zero the poll-plan jitter so cadence tests are clock-exact; the jitter
     itself is exercised in test_poll_policy via an injected rng."""

@@ -2,8 +2,9 @@
 
 One versioned JSON file for user-tunable claude-swap preferences, written
 atomically with the backup dir's 0600/0700 modes. v1 carries the
-``autoswitch`` and ``ui`` sections; other sections can be added additively.
-Unknown keys (future fields, other tools' experiments) survive a round trip.
+``autoswitch``, ``restart`` and ``ui`` sections; other sections can be added
+additively. Unknown keys (future fields, other tools' experiments) survive a
+round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
 warning, never a crash — so a bad hand edit degrades to default behavior.
@@ -27,6 +28,16 @@ SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
 
 _logger = logging.getLogger("claude-swap")
+
+# What may set off an automatic switch (``autoswitch.triggers``): a usage
+# window over its line — the 5-hour window, the 7-day window, or a per-model
+# weekly window named by ``autoswitch.model`` — or one of the engine's two
+# triggers that are not a window crossing its line: ``failover`` (the active
+# account's usage stays unreadable) and ``consume-first`` (the strategy's
+# below-the-line move to the account whose week resets soonest).
+SWITCH_TRIGGERS = ("5h", "7d", "model", "failover", "consume-first")
+# Shorthands accepted wherever triggers are written.
+TRIGGER_GROUPS = {"weekly": ("7d", "model"), "all": SWITCH_TRIGGERS}
 
 
 @dataclass(frozen=True)
@@ -67,6 +78,54 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Off: a live engine refuses to start (``cswap auto``, the menu bar and
+    # TUI auto-switchers). Switching happens only when asked for; a dry run,
+    # which only reports, is always allowed.
+    enabled: bool = False
+    # Comma-separated SWITCH_TRIGGERS / TRIGGER_GROUPS names allowed to set
+    # off a switch (e.g. "weekly" to switch only on the weekly limits). A
+    # window outside it may sit over its line, even exhausted, and the engine
+    # waits for its reset. None = every trigger (default).
+    triggers: str | None = None
+
+
+@dataclass(frozen=True)
+class RestartSettings:
+    """How an account switch treats running Claude Code sessions (``restart``).
+
+    With ``on_switch`` every switch — ``cswap switch``, the auto-switch
+    engine, the menu bar and the TUI — closes each session it can reopen,
+    swaps the account, and reopens each where it was, resumed by id, so the
+    sessions run on the new account at once instead of after the macOS
+    Keychain cache expires. ``resume`` picks what a reopened session loads:
+    ``full`` resumes the whole conversation without Claude Code's offer to
+    resume an old, large one from a summary; ``ask`` leaves that offer to
+    the user. See ``relaunch`` for the order of events.
+    """
+
+    on_switch: bool = True
+    resume: str = "full"
+    # How long working sessions (a turn, a background shell, a question
+    # waiting for an answer) get to finish; each is closed as soon as it is
+    # idle.
+    busy_timeout_seconds: float = 120.0
+    # When that wait runs out: "close" the sessions still working, whose
+    # interrupted turn is re-run on resume when ``continue_interrupted`` is
+    # on, or "abort" the switch and reopen the closed ones unswitched.
+    on_busy_timeout: str = "close"
+    # Reopened sessions re-run a turn the close (or a rate limit) cut off.
+    continue_interrupted: bool = True
+    # How long a session gets to exit after SIGTERM before SIGKILL.
+    close_timeout_seconds: float = 15.0
+    # How long a reopened session has to write its record before it is
+    # reported as not started.
+    reopen_timeout_seconds: float = 60.0
+    # Where a session reopens when its own terminal cannot take it back (an
+    # editor's terminal, Ghostty, Warp, a closed tab): "terminal" (a new
+    # Terminal.app window), "iterm" (iTerm2), "tmux" (a tmux session named
+    # cswap), "auto" (Terminal.app on macOS, tmux elsewhere), or "none"
+    # (such sessions are left running).
+    fallback: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -77,7 +136,11 @@ class UiSettings:
     theme: str = "auto"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "restart": RestartSettings,
+    "ui": UiSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -89,13 +152,13 @@ class SettingSpec:
     (`parse_setting_value`) read from here, so the two can't drift.
     """
 
-    section: str  # top-level JSON section ("autoswitch", "ui")
+    section: str  # top-level JSON section ("autoswitch", "restart", "ui")
     json_key: str  # camelCase key inside the section
-    field: str  # snake_case AutoSwitchSettings field
-    kind: str  # "float" | "int" | "bool" | "choice"
+    field: str  # snake_case field of the section's settings dataclass
+    kind: str  # "float" | "int" | "bool" | "choice" | "string" | "set"
     lo: float | None = None
     hi: float | None = None
-    choices: tuple[str, ...] = ()
+    choices: tuple[str, ...] = ()  # "choice": one of them; "set": a comma list of them
     help: str = ""
 
     @property
@@ -150,6 +213,50 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
         ),
         SettingSpec(
+            "autoswitch", "enabled", "enabled", "bool",
+            help="Allow automatic switching (cswap auto, menu bar, TUI); off by default",
+        ),
+        SettingSpec(
+            "autoswitch", "triggers", "triggers", "set",
+            choices=SWITCH_TRIGGERS + tuple(TRIGGER_GROUPS),
+            help="Only these may set off an automatic switch: 5h, 7d, model, "
+            "weekly (7d,model), failover, consume-first (unset: all)",
+        ),
+        SettingSpec(
+            "restart", "onSwitch", "on_switch", "bool",
+            help="A switch closes running sessions, switches, and reopens them resumed",
+        ),
+        SettingSpec(
+            "restart", "resume", "resume", "choice", choices=("full", "ask"),
+            help="Reopened sessions resume the full conversation, or ask (summary offer)",
+        ),
+        SettingSpec(
+            "restart", "busyTimeoutSeconds", "busy_timeout_seconds", "float", 0.0, 3600.0,
+            help="Wait this long for working sessions to finish their turn",
+        ),
+        SettingSpec(
+            "restart", "onBusyTimeout", "on_busy_timeout", "choice",
+            choices=("close", "abort"),
+            help="Then close the ones still working, or call the switch off",
+        ),
+        SettingSpec(
+            "restart", "continueInterrupted", "continue_interrupted", "bool",
+            help="Reopened sessions re-run a turn the close or a rate limit cut off",
+        ),
+        SettingSpec(
+            "restart", "closeTimeoutSeconds", "close_timeout_seconds", "float", 1.0, 300.0,
+            help="Wait this long for a session to exit before killing it",
+        ),
+        SettingSpec(
+            "restart", "reopenTimeoutSeconds", "reopen_timeout_seconds", "float", 5.0, 600.0,
+            help="Wait this long for each reopened session to start",
+        ),
+        SettingSpec(
+            "restart", "fallback", "fallback", "choice",
+            choices=("auto", "terminal", "iterm", "tmux", "none"),
+            help="Where a session reopens when its own terminal can't take it back",
+        ),
+        SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
         ),
@@ -181,8 +288,38 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
     return tuple(seen.values())
 
 
+def parse_triggers(value: str | None) -> frozenset[str]:
+    """The SWITCH_TRIGGERS a stored ``autoswitch.triggers`` value allows,
+    groups expanded. None allows every trigger. Unknown names are ignored:
+    ``cswap config set`` refuses them, and loading drops them with a
+    warning, so none reach here from either."""
+    if value is None:
+        return frozenset(SWITCH_TRIGGERS)
+    allowed: set[str] = set()
+    for name in _set_names(value):
+        allowed.update(TRIGGER_GROUPS.get(name, (name,)))
+    return frozenset(allowed) & frozenset(SWITCH_TRIGGERS)
+
+
+def _set_names(value: str) -> list[str]:
+    """A "set" value's names: split on commas, trimmed, lowercased, first
+    occurrence kept."""
+    names: list[str] = []
+    for part in value.split(","):
+        name = part.strip().lower()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
     """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
+    return AutoSwitchSettings(**_clamped_fields("autoswitch", settings))
+
+
+def _clamped_fields(section: str, settings) -> dict:
+    """``section``'s fields of ``settings``, each clamped into its spec's
+    range, with a bad type or unknown choice replaced by the default."""
 
     def num(value, default: float | None, lo: float, hi: float) -> float | None:
         # json.loads accepts NaN/Infinity literals and min/max pass NaN
@@ -200,7 +337,7 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
 
     kwargs = {}
     for spec in SETTING_SPECS.values():
-        if spec.section != "autoswitch":
+        if spec.section != section:
             continue
         value = getattr(settings, spec.field)
         if spec.kind in ("float", "int"):
@@ -212,6 +349,8 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
             # A non-empty string keeps as-is; anything else reverts to default
             # (None) so a null/garbage settings.json value disables the filter.
             kwargs[spec.field] = value if isinstance(value, str) and value else spec.default
+        elif spec.kind == "set":
+            kwargs[spec.field] = _clamped_set(spec, value)
         else:  # choice
             if value not in spec.choices:
                 _logger.warning(
@@ -220,7 +359,24 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
                 )
                 value = spec.default
             kwargs[spec.field] = value
-    return AutoSwitchSettings(**kwargs)
+    return kwargs
+
+
+def _clamped_set(spec: SettingSpec, value):
+    """A "set" value with unknown names dropped (warned), or the default when
+    it is not a string or names nothing known."""
+    if not isinstance(value, str):
+        return spec.default
+    names = _set_names(value)
+    known = [name for name in names if name in spec.choices]
+    if len(known) != len(names):
+        _logger.warning(
+            "settings.json: %s ignores unknown %s (valid: %s)",
+            spec.dotted,
+            ", ".join(name for name in names if name not in spec.choices),
+            ", ".join(spec.choices),
+        )
+    return ",".join(known) if known else spec.default
 
 
 def _read_raw(path: Path) -> dict:
@@ -252,6 +408,24 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
     except TypeError:
         settings = AutoSwitchSettings()
     return _clamped(settings)
+
+
+def load_restart_settings(backup_root: Path) -> RestartSettings:
+    """Load the restart section; missing/corrupt file or fields → defaults."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("restart")
+    if not isinstance(section, dict):
+        return RestartSettings()
+    kwargs = {
+        spec.field: section[spec.json_key]
+        for spec in SETTING_SPECS.values()
+        if spec.section == "restart" and spec.json_key in section
+    }
+    try:
+        settings = RestartSettings(**kwargs)
+    except TypeError:
+        settings = RestartSettings()
+    return RestartSettings(**_clamped_fields("restart", settings))
 
 
 def load_ui_settings(backup_root: Path) -> UiSettings:
@@ -332,6 +506,21 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
                 f"'cswap config unset {spec.dotted}' to clear it"
             )
         return value
+    if spec.kind == "set":
+        names = _set_names(raw_value)
+        if not names:
+            raise ConfigError(
+                f"{spec.dotted} expects a comma-separated list of: "
+                f"{', '.join(spec.choices)}; use 'cswap config unset "
+                f"{spec.dotted}' to clear it"
+            )
+        unknown = [name for name in names if name not in spec.choices]
+        if unknown:
+            raise ConfigError(
+                f"{spec.dotted}: unknown {', '.join(unknown)}; valid: "
+                f"{', '.join(spec.choices)}"
+            )
+        return ",".join(names)
     try:
         value = int(raw_value) if spec.kind == "int" else float(raw_value)
     except ValueError:
@@ -441,6 +630,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     raw = _read_raw(settings_path(backup_root))
     loaded = {
         "autoswitch": load_settings(backup_root),
+        "restart": load_restart_settings(backup_root),
         "ui": load_ui_settings(backup_root),
     }
     rows = []
@@ -462,6 +652,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("triggers", "triggers"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

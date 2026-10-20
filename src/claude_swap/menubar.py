@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import pace
-from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.exceptions import AutoSwitchDisabledError, ClaudeSwitchError, CredentialReadError
 from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -548,8 +548,13 @@ def run(switcher) -> int:
     )
 
     from claude_swap.autoswitch import AutoSwitchEngine
+    from claude_swap.relaunch import restart_summary, restarter_for
     from claude_swap.settings import load_settings, set_setting
     from claude_swap.snapshot_source import SnapshotSource
+
+    # Every switch from here — the menu's and the engine's — restarts the
+    # sessions when restart.onSwitch asks for it.
+    switcher.around_switch = restarter_for(switcher.backup_dir)
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
     log_path = switcher.backup_dir / "claude-swap.log"
@@ -577,6 +582,11 @@ def run(switcher) -> int:
             self._engine = None
             self._engine_events: list = []
             self._event_lock = threading.Lock()
+            # A menu switch runs on a thread (closing and reopening sessions
+            # takes as long as their turns do); its outcome is queued here for
+            # the main thread under _event_lock.
+            self._switching = False
+            self._switch_outcomes: list = []
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -642,6 +652,7 @@ def run(switcher) -> int:
                 self.rebuild_menu()
             self._detect_active_change()
             self._drain_engine_events()
+            self._drain_switch_outcomes()
 
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto engine)
@@ -677,6 +688,13 @@ def run(switcher) -> int:
                     self._on_engine_event,
                     dry_run=False,
                 )
+            except AutoSwitchDisabledError as e:
+                # Leave the toggle showing the truth: off.
+                self.settings.auto_switch_enabled = False
+                self.settings.save(settings_path)
+                rumps.notification("claude-swap", "Auto-switch is turned off", str(e))
+                self.rebuild_menu()
+                return
             except Exception as e:  # never let a bad start crash the menu bar
                 self.switcher._logger.warning("auto-switch engine failed to start: %s", e)
                 rumps.notification("claude-swap", "Auto-switch failed to start", str(e))
@@ -896,25 +914,58 @@ def run(switcher) -> int:
                 rumps.alert(title="claude-swap", message=str(e))
                 return False
 
-        def _notify_switched(self):
-            rumps.notification(
-                "claude-swap",
-                "Account switched",
-                "Switch takes effect within ~30s — restart Claude Code to apply immediately.",
-            )
+        def _notify_switched(self, result):
+            restart = (result or {}).get("restart")
+            if restart is None:
+                detail = "Switch takes effect within ~30s — restart Claude Code to apply immediately."
+            else:
+                detail = f"Claude Code sessions: {restart_summary(restart)}."
+            rumps.notification("claude-swap", "Account switched", detail)
+
+        def _switch_async(self, fn):
+            if self._switching:
+                rumps.notification("claude-swap", "A switch is already running", "")
+                return
+            self._switching = True
+
+            def work():
+                try:
+                    outcome = ("done", fn())
+                except ClaudeSwitchError as e:
+                    outcome = ("error", str(e))
+                except Exception as e:  # never let a switch thread die silently
+                    self.switcher._logger.warning("menu switch failed", exc_info=True)
+                    outcome = ("error", f"{type(e).__name__}: {e}")
+                with self._event_lock:
+                    self._switch_outcomes.append(outcome)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _drain_switch_outcomes(self):
+            with self._event_lock:
+                outcomes, self._switch_outcomes = self._switch_outcomes, []
+            for kind, value in outcomes:
+                self._switching = False
+                if kind == "error":
+                    rumps.alert(title="claude-swap", message=value)
+                elif value and value.get("switched"):
+                    self._notify_switched(value)
+                elif value:
+                    rumps.notification("claude-swap", "No switch", value.get("message", ""))
+                self.refresh_async()
 
         def _make_switch_to(self, num):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch_to(str(num))):
-                    self._notify_switched()
-                    self.refresh_async()
+                self._switch_async(
+                    lambda: self.switcher.switch_to(str(num), json_output=True)
+                )
             return cb
 
         def _switch(self, strategy):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch(strategy=strategy)):
-                    self._notify_switched()
-                    self.refresh_async()
+                self._switch_async(
+                    lambda: self.switcher.switch(strategy=strategy, json_output=True)
+                )
             return cb
 
         def _make_remove(self, num):
