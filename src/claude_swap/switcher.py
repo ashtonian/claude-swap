@@ -7041,21 +7041,21 @@ class ClaudeAccountSwitcher:
                 else self._prefetch_live_identity()
             )
 
-        restart = self.around_switch
-        if restart is None:
-            return self._activate(
+        finishes: list[Callable[[bool], None]] = []
+
+        def swap() -> dict:
+            op, finish = self._activate(
                 target_account, emit_output, force_activate, provenance, warnings_out
             )
-        return restart(
-            lambda: self._activate(
-                target_account,
-                emit_output,
-                force_activate,
-                provenance,
-                warnings_out,
-                restarting=True,
-            )
-        )
+            finishes.append(finish)
+            return op
+
+        # The restart closes the sessions around the swap alone: the display
+        # after it (a usage fetch per account) runs once they are back.
+        op = swap() if self.around_switch is None else self.around_switch(swap)
+        if finishes:
+            finishes[0]("restart" in op)
+        return op
 
     def _activate(
         self,
@@ -7064,14 +7064,12 @@ class ClaudeAccountSwitcher:
         force_activate: bool,
         provenance: dict,
         warnings_out: list[str],
-        *,
-        restarting: bool = False,
-    ) -> dict:
+    ) -> tuple[dict, Callable[[bool], None]]:
         """The switch itself, once ``_perform_switch``'s refusals have passed:
-        under the locks, back up the outgoing login and activate the target;
-        then, unlocked, the display. ``restarting``: ``around_switch`` reopens
-        the sessions on the new account, so the follow-up says so instead of
-        advising a restart."""
+        under the locks, back up the outgoing login and activate the target.
+        Returns the result and the step that follows it, unlocked: the
+        display and the poll re-plan, told whether the sessions were
+        restarted around the switch."""
         # Beyond cswap's own lock, hold Claude Code's advisory locks for the
         # whole mutation (including rollback paths): its token refresh runs
         # under ~/.claude.lock and re-reads credentials there — holding it
@@ -7275,19 +7273,22 @@ class ClaudeAccountSwitcher:
                     self._logger.info(
                         f"Activated account {target_account} (no prior live account)"
                     )
-                if emit_output:
-                    print(
-                        f"{accent('Activated')} Account-{target_account} ({target_email})"
-                    )
-                    print()
-                    self._print_switch_followup(restarting)
-                    print()
-                self._replan_new_active(
-                    target_account,
-                    target_email,
-                    data["accounts"][target_account].get("organizationUuid", ""),
+                activated_org = data["accounts"][target_account].get("organizationUuid", "")
+
+                def finish_activation(restarted: bool) -> None:
+                    if emit_output:
+                        print(
+                            f"{accent('Activated')} Account-{target_account} ({target_email})"
+                        )
+                        print()
+                        self._print_switch_followup(restarted)
+                        print()
+                    self._replan_new_active(target_account, target_email, activated_org)
+
+                return (
+                    {"from": from_ref, "to": to_ref, "warnings": warnings_out},
+                    finish_activation,
                 )
-                return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
             current_email, _ = current_identity
             from_ref = account_ref(int(current_account), current_email)
@@ -7534,31 +7535,32 @@ class ClaudeAccountSwitcher:
                         )
                 raise
 
-        # Lock released. Safe to do network I/O and let persist callbacks
-        # re-acquire the lock from inside list_accounts(). All of this is display
-        # only — suppressed in JSON mode (the nested list_accounts() would
-        # otherwise leak human output onto the JSON stdout).
-        if emit_output:
-            print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
-            try:
-                self.list_accounts()
-            except Exception as e:
-                self._logger.warning(f"Post-switch usage display failed: {e!r}")
-                print(dimmed("  (usage display unavailable — run `cswap --list` to retry)"))
-            print()
-            self._print_switch_followup(restarting)
-            print()
-        self._replan_new_active(
-            target_account,
-            target_email,
-            data["accounts"][target_account].get("organizationUuid", ""),
-        )
-        return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+        target_org = data["accounts"][target_account].get("organizationUuid", "")
 
-    def _print_switch_followup(self, restarting: bool = False) -> None:
+        def finish_switch(restarted: bool) -> None:
+            # Lock released. Safe to do network I/O and let persist callbacks
+            # re-acquire the lock from inside list_accounts(). All of this is
+            # display only — suppressed in JSON mode (the nested
+            # list_accounts() would otherwise leak human output onto the JSON
+            # stdout).
+            if emit_output:
+                print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
+                try:
+                    self.list_accounts()
+                except Exception as e:
+                    self._logger.warning(f"Post-switch usage display failed: {e!r}")
+                    print(dimmed("  (usage display unavailable — run `cswap --list` to retry)"))
+                print()
+                self._print_switch_followup(restarted)
+                print()
+            self._replan_new_active(target_account, target_email, target_org)
+
+        return {"from": from_ref, "to": to_ref, "warnings": warnings_out}, finish_switch
+
+    def _print_switch_followup(self, restarted: bool = False) -> None:
         """Print the note after a successful switch, keyed to where the active
-        credential write actually landed — or, ``restarting``, that the
-        sessions are being reopened on the new account.
+        credential write actually landed. Nothing once the sessions were
+        ``restarted`` around the switch: they already run on the new account.
 
         A restart is never required: Claude Code clears its cached OAuth token when
         ``.credentials.json`` changes (file storage — effective on the next message)
@@ -7567,8 +7569,7 @@ class ClaudeAccountSwitcher:
         The file line also covers macOS when the Keychain was unavailable and the
         switch fell back to the file.
         """
-        if restarting:
-            print(dimmed("Reopening the closed Claude Code sessions on the new account."))
+        if restarted:
             return
         backend = self._last_active_credentials_backend
         if backend is None:

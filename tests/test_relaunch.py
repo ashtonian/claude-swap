@@ -18,6 +18,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -424,6 +425,62 @@ class TestFallbackKind:
         assert relaunch.fallback_kind(setting) == other
 
 
+class TestTmuxBackend:
+    def _record(self, monkeypatch, answers):
+        calls = []
+
+        def run_tool(command, **kwargs):
+            calls.append(list(command))
+            return answers.get(command[-1], "")
+
+        monkeypatch.setattr(relaunch, "_run_tool", run_tool)
+        return calls
+
+    def test_typing_leaves_copy_mode_first(self, monkeypatch):
+        calls = self._record(monkeypatch, {"#{pane_in_mode}": "1"})
+        relaunch._Tmux().type_line(Terminal("tmux", "%3", tool="tmux"), " sh x")
+        sent = [c[c.index("send-keys"):] for c in calls if "send-keys" in c]
+        assert sent == [
+            ["send-keys", "-t", "%3", "-X", "cancel"],
+            ["send-keys", "-t", "%3", "-l", " sh x"],
+            ["send-keys", "-t", "%3", "Enter"],
+        ]
+
+    def test_typing_outside_copy_mode_types_only(self, monkeypatch):
+        calls = self._record(monkeypatch, {"#{pane_in_mode}": "0"})
+        relaunch._Tmux().type_line(Terminal("tmux", "%3", tool="tmux"), " sh x")
+        assert not any("cancel" in c for c in calls)
+
+    def test_a_pane_that_could_not_be_closed_gets_its_option_back(self, tmp_path):
+        released = []
+
+        class Tmux:
+            def keep_pane(self, term):
+                pass
+
+            def release_pane(self, term):
+                released.append(term.target)
+
+        session = PlannedSession(
+            pid=2**22 + 7, proc_start=None, session_id=SID, name="a", status="idle",
+            kind="interactive", where="tmux pane %9", terminal=Terminal("tmux", "%9"),
+            shell_pid=None, directory="/", command=("claude",), env={},
+        )
+
+        def kill(pid, sig):
+            raise PermissionError("not yours")
+
+        restarter = SessionRestarter(
+            tmp_path, RestartSettings(), terminals={"tmux": Tmux()}, kill=kill,
+            progress=lambda line: None,
+        )
+        report = relaunch.RestartReport()
+        closed = []
+        restarter._close_batch([session], report, closed)
+        assert closed == [] and released == ["%9"]
+        assert report.skipped[0].reason == "not yours"
+
+
 def test_restart_summary():
     assert restart_summary({"reopened": [1, 2, 3], "failed": []}) == "reopened 3 of 3 session(s)"
     assert restart_summary({"reopened": [1], "failed": [2]}).startswith("reopened 1 of 2 session(s);")
@@ -657,6 +714,7 @@ class Fleet:
         defaults = {
             "close_timeout_seconds": 5.0,
             "reopen_timeout_seconds": 20.0,
+            "reopen_stagger_seconds": 0.0,
             "fallback": "tmux",
         }
         self.fallback = ShellTerminal(self.base_env, app="fallback")
@@ -943,6 +1001,113 @@ class TestRestartEndToEnd:
             restarter(switch)
         assert relaunch.is_pid_alive(old)
         assert restarter.last_report.reopened == []
+
+    def test_ctrl_c_while_waiting_reopens_what_was_closed(self, fleet, monkeypatch):
+        terminal = fleet.terminal(monkeypatch)
+        idle = fleet.start(SID, name="alpha")
+        busy_id = "99999999-2222-3333-4444-555555555555"
+        busy = fleet.start(busy_id, name="beta", status="busy")
+        restarter = fleet.restarter(terminal, busy_timeout_seconds=60.0)
+        pressed = []
+
+        def sleep(seconds):
+            # One Ctrl-C, while the idle session is on its way down.
+            if not pressed:
+                pressed.append(True)
+                raise KeyboardInterrupt
+            time.sleep(0.05)
+
+        restarter.sleep = sleep
+        switched = []
+
+        with pytest.raises(KeyboardInterrupt):
+            restarter(lambda: switched.append(True) or {})
+
+        assert switched == []
+        assert fleet.wait_for_record(SID, not_pid=idle) != idle, "the closed one is back"
+        assert relaunch.is_pid_alive(busy), "the working one was never touched"
+
+    @pytest.mark.skipif(
+        threading.current_thread() is not threading.main_thread(),
+        reason="signal handlers need the main thread",
+    )
+    def test_sigterm_mid_restart_still_reopens(self, fleet, monkeypatch):
+        terminal = fleet.terminal(monkeypatch)
+        old = fleet.start(SID, name="alpha")
+        restarter = fleet.restarter(terminal)
+        before = signal.getsignal(signal.SIGTERM)
+
+        def switch():
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(1)  # the handler raises here
+            return {}
+
+        with pytest.raises(relaunch.RestartInterrupted):
+            restarter(switch)
+        assert fleet.wait_for_record(SID, not_pid=old) != old
+        assert signal.getsignal(signal.SIGTERM) is before, "the old handler is back"
+
+    def test_a_record_caught_mid_rewrite_is_not_taken_for_an_exit(self, fleet, monkeypatch):
+        terminal = fleet.terminal(monkeypatch)
+        busy = fleet.start(SID, name="alpha", status="busy")
+        record = fleet.claude_dir / "sessions" / f"{busy}.json"
+        good = json.loads(record.read_text())
+        steps = iter(["torn", "idle"])
+
+        def sleep(seconds):
+            step = next(steps, None)
+            if step == "torn":
+                record.write_text('{"pid": ')  # what a reader sees mid-write
+            elif step == "idle":
+                record.write_text(json.dumps({**good, "status": "idle"}))
+            time.sleep(0.05)
+
+        restarter = fleet.restarter(terminal, busy_timeout_seconds=60.0)
+        restarter.sleep = sleep
+        result = restarter(lambda: {"from": None, "to": None, "warnings": []})
+        assert result["restart"]["exited"] == []
+        assert [r["sessionId"] for r in result["restart"]["reopened"]] == [SID]
+
+    def test_idle_sessions_close_together(self, fleet, monkeypatch):
+        terminal = fleet.terminal(monkeypatch)
+        fleet.start(SID, name="alpha")
+        fleet.start("99999999-2222-3333-4444-555555555555", name="beta")
+        log = []
+        restarter = fleet.restarter(terminal)
+        restarter.kill = lambda pid, sig: (log.append(("kill", sig)), os.kill(pid, sig))
+        restarter.sleep = lambda seconds: (log.append(("sleep", seconds)), time.sleep(0.05))
+        restarter(lambda: {"from": None, "to": None, "warnings": []})
+        assert log[:2] == [("kill", signal.SIGTERM), ("kill", signal.SIGTERM)], (
+            "both are signalled before waiting on either"
+        )
+
+    def test_reopens_are_staggered(self, fleet, monkeypatch):
+        terminal = fleet.terminal(monkeypatch)
+        fleet.start(SID, name="alpha")
+        fleet.start("99999999-2222-3333-4444-555555555555", name="beta")
+        slept = []
+        restarter = fleet.restarter(terminal, reopen_stagger_seconds=0.3)
+        restarter.sleep = lambda seconds: (slept.append(seconds), time.sleep(0.05))
+        restarter(lambda: {"from": None, "to": None, "warnings": []})
+        assert slept.count(0.3) == 1, "one gap between two reopens"
+
+    def test_settings_are_read_at_every_switch(self, fleet, monkeypatch):
+        terminal = fleet.terminal(monkeypatch)
+        old = fleet.start(SID, name="alpha")
+        current = {"settings": RestartSettings(on_switch=False)}
+        restarter = SessionRestarter(
+            fleet.state_dir,
+            load_settings=lambda: current["settings"],
+            claude_dir=fleet.claude_dir,
+            terminals={"muxy": terminal},
+            foreground=lambda pid: True,
+        )
+        result = restarter(lambda: {"switched": True})
+        assert result == {"switched": True} and relaunch.is_pid_alive(old)
+
+        current["settings"] = RestartSettings(reopen_stagger_seconds=0.0)
+        result = restarter(lambda: {"switched": True})
+        assert [r["sessionId"] for r in result["restart"]["reopened"]] == [SID]
 
     def test_reopen_finishes_an_interrupted_restart(self, fleet, monkeypatch):
         terminal = fleet.terminal(monkeypatch)

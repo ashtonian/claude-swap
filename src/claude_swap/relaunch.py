@@ -62,6 +62,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -713,14 +714,20 @@ class _Tmux:
     def keep_pane(self, term: Terminal) -> None:
         self._run(term, "set-option", "-p", "-t", term.target, "remain-on-exit", "on")
 
+    def release_pane(self, term: Terminal) -> None:
+        self._run(term, "set-option", "-p", "-u", "-t", term.target, "remain-on-exit")
+
     def pane_dead(self, term: Terminal) -> bool:
         return self._get(term, "#{pane_dead}") == "1"
 
     def respawn(self, term: Terminal, directory: str, script: Path) -> None:
         self._run(term, "respawn-pane", "-t", term.target, "-c", directory, _run_line(script))
-        self._run(term, "set-option", "-p", "-u", "-t", term.target, "remain-on-exit")
+        self.release_pane(term)
 
     def type_line(self, term: Terminal, line: str) -> None:
+        if self._get(term, "#{pane_in_mode}") == "1":
+            # Scrolled back (copy mode): keys would be copy-mode commands.
+            self._run(term, "send-keys", "-t", term.target, "-X", "cancel")
         self._run(term, "send-keys", "-t", term.target, "-l", line)
         self._run(term, "send-keys", "-t", term.target, "Enter")
 
@@ -827,7 +834,8 @@ end run
         tty = self._find(term.target)
         if not tty:
             raise TerminalError(f"{term.describe()} is not open")
-        if tty != _session_tty(session_pid):
+        own = _session_tty(session_pid)
+        if own is not None and tty != own:
             raise TerminalError(f"{term.describe()} does not run it")
         return term, None
 
@@ -1246,16 +1254,61 @@ class RestartReport:
         ]
 
 
+class RestartInterrupted(KeyboardInterrupt):
+    """SIGTERM or SIGHUP arrived while sessions were closed. Raised like
+    Ctrl-C, so the reopen still runs and nothing that catches ``Exception``
+    swallows it."""
+
+
+@contextlib.contextmanager
+def _interrupt_on_signals():
+    """While sessions may be closed, turn SIGTERM and SIGHUP (a logout, a
+    closed terminal, ``kill``) into ``RestartInterrupted`` and let only the
+    first SIGINT through, so the reopen in the ``finally`` that follows is
+    never cut short. Signal handlers belong to the main thread; elsewhere
+    (the menu bar's switch thread) this does nothing."""
+    if sys.platform == "win32" or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    raised = False
+
+    def handler(signum, frame):
+        nonlocal raised
+        if raised:
+            return  # already unwinding into the reopen; let it finish
+        raised = True
+        if signum == signal.SIGINT:
+            raise KeyboardInterrupt
+        raise RestartInterrupted(signal.Signals(signum).name)
+
+    previous = {
+        sig: signal.signal(sig, handler)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    }
+    try:
+        yield
+    finally:
+        for sig, old in previous.items():
+            signal.signal(sig, old)
+
+
 class SessionRestarter:
     """Wraps an account switch: closes the running sessions, runs the switch,
     reopens them. Installed on a switcher as ``around_switch``; see the
-    module docstring for the order and the rules."""
+    module docstring for the order and the rules.
+
+    Settings come from ``settings``, or are loaded by ``load_settings`` at
+    every switch, so a long-running host (the menu bar, ``cswap auto``)
+    follows ``cswap config set restart.*`` without restarting. ``enabled``
+    overrides ``restart.onSwitch`` (``--restart``/``--no-restart``)."""
 
     def __init__(
         self,
         state_dir: Path,
-        settings: RestartSettings,
+        settings: RestartSettings | None = None,
         *,
+        load_settings: Callable[[], RestartSettings] | None = None,
+        enabled: bool | None = None,
         claude_dir: Path | None = None,
         close_busy: bool = False,
         progress: Callable[[str], None] | None = None,
@@ -1265,12 +1318,17 @@ class SessionRestarter:
         foreground: Callable[[int], bool | None] = owns_terminal,
         kill: Callable[[int, int], None] = os.kill,
     ):
+        if settings is None and load_settings is None:
+            raise ValueError("SessionRestarter needs settings or load_settings")
         self.state_dir = state_dir
-        self.settings = settings
+        self.settings = settings if settings is not None else load_settings()
+        self.load_settings = load_settings
+        self.enabled = enabled
         self.claude_dir = claude_dir
         # Close working sessions at once instead of waiting for them.
         self.close_busy = close_busy
-        self.progress = progress or _logger.info
+        # Each step also goes to the log, whoever shows it.
+        self.progress = progress
         self.clock = clock
         self.sleep = sleep
         # Terminal backends by Terminal.kind; whether a shell owns its
@@ -1286,10 +1344,22 @@ class SessionRestarter:
     def plan_path(self) -> Path:
         return self.state_dir / PLAN_FILENAME
 
+    def refresh_settings(self) -> RestartSettings:
+        if self.load_settings is not None:
+            self.settings = self.load_settings()
+        return self.settings
+
+    def enabled_now(self) -> bool:
+        """Whether a switch now restarts the sessions."""
+        settings = self.refresh_settings()
+        return settings.on_switch if self.enabled is None else self.enabled
+
     def plan(self) -> RestartPlan:
         return plan_restart(self.claude_dir, fallback=self.settings.fallback)
 
     def __call__(self, switch: Callable[[], dict]) -> dict:
+        if not self.enabled_now():
+            return switch()
         with self._locked():
             return self._restart(switch)
 
@@ -1306,30 +1376,40 @@ class SessionRestarter:
         finally:
             lock.release()
 
+    def _say(self, message: str) -> None:
+        _logger.info("restart: %s", message)
+        if self.progress is not None:
+            self.progress(message)
+
     def _restart(self, switch: Callable[[], dict]) -> dict:
         plan = self.plan()
         report = RestartReport(hosting=list(plan.hosting), skipped=list(plan.skipped))
         self.last_report = report
         for s in plan.skipped:
-            self.progress(f"Leaving {s.label} running: {s.reason}")
+            self._say(f"Leaving {s.label} running: {s.reason}")
         for s in plan.hosting:
-            self.progress(f"Leaving {s.label} running: this command runs inside it")
+            self._say(f"Leaving {s.label} running: this command runs inside it")
         if plan.unreadable:
-            self.progress(f"{plan.unreadable} session record(s) could not be read")
+            self._say(f"{plan.unreadable} session record(s) could not be read")
 
         interactive = [s for s in plan.sessions if s.kind == "interactive"]
         background = [s for s in plan.sessions if s.kind == "background"]
         self._save(plan.sessions)
-        closed = self._close_all(interactive, report)
+        # Filled as sessions close, so whatever ends the close or the switch
+        # early — the switch failing, the wait being called off, Ctrl-C,
+        # SIGTERM — the sessions closed so far are reopened.
+        closed: list[PlannedSession] = []
         switched = False
-        try:
-            result = switch()
-            switched = True
-        finally:
-            # Background sessions only restart onto a switch that landed:
-            # respawning them onto the same account would interrupt them
-            # for nothing.
-            self._reopen_all([*closed, *(background if switched else ())], report)
+        with _interrupt_on_signals():
+            try:
+                self._close_all(interactive, report, closed)
+                result = switch()
+                switched = True
+            finally:
+                # Background sessions only restart onto a switch that
+                # landed: respawning them onto the same account would
+                # interrupt them for nothing.
+                self._reopen_all([*closed, *(background if switched else ())], report)
         result = dict(result)
         result["restart"] = report.to_json()
         result["warnings"] = [*result.get("warnings", []), *report.warnings()]
@@ -1338,23 +1418,31 @@ class SessionRestarter:
     # -- close ----------------------------------------------------------------
 
     def _close_all(
-        self, sessions: Sequence[PlannedSession], report: RestartReport
-    ) -> list[PlannedSession]:
-        """Close each session once it is idle; when the wait runs out, close
-        the rest or call the switch off. Returns the closed ones."""
+        self,
+        sessions: Sequence[PlannedSession],
+        report: RestartReport,
+        closed: list[PlannedSession],
+    ) -> None:
+        """Close the sessions into ``closed``, each batch of idle ones as soon
+        as it is seen idle; when the wait runs out, close the rest mid-turn,
+        or call the switch off (``RestartBlockedError``)."""
         pending = {s.key: s for s in sessions}
-        closed: list[PlannedSession] = []
         wait = 0.0 if self.close_busy else self.settings.busy_timeout_seconds
         deadline = self.clock() + wait
         announced = False
         while pending:
             live = {r.pid: r for r in scan_sessions(self.claude_dir)[0]}
+            idle: list[PlannedSession] = []
             for key, session in list(pending.items()):
                 record = live.get(session.pid)
                 if record is None:
+                    if is_pid_alive(session.pid) and pid_matches_record(
+                        session.pid, session.proc_start
+                    ):
+                        continue  # its record is being rewritten: look again
                     del pending[key]
                     report.exited.append(session)
-                    self.progress(f"{session.label} exited on its own; not reopening it")
+                    self._say(f"{session.label} exited on its own; not reopening it")
                     continue
                 if record.session_id and record.session_id != session.session_id:
                     # /clear (or /resume) inside it moved it to another
@@ -1362,13 +1450,13 @@ class SessionRestarter:
                     session = pending[key] = replace(session, session_id=record.session_id)
                 if record.status in _IDLE_STATUSES:
                     del pending[key]
-                    self._close(session, closed, report)
+                    idle.append(session)
+            self._close_batch(idle, report, closed)
             if not pending:
-                break
+                return
             if self.clock() >= deadline:
+                still = list(pending.values())
                 if self.settings.on_busy_timeout == "abort" and not self.close_busy:
-                    still = list(pending.values())
-                    self._reopen_all(closed, report)
                     raise RestartBlockedError(
                         f"{len(still)} session(s) still working after "
                         f"{wait:.0f}s, so the switch was called off: "
@@ -1376,80 +1464,124 @@ class SessionRestarter:
                         + ". Wait for them, or switch with --close-busy",
                         busy=still,
                     )
-                for session in pending.values():
-                    self.progress(f"Closing {session.label} mid-turn")
-                    if self._close(session, closed, report):
-                        report.interrupted.append(session)
-                break
+                self._say("Closing mid-turn: " + ", ".join(s.label for s in still))
+                self._close_batch(still, report, closed, mid_turn=True)
+                return
             if not announced:
                 announced = True
-                self.progress(
-                    f"Waiting up to {wait:.0f}s for {len(pending)} working "
-                    "session(s) to finish their turn"
+                self._say(
+                    f"Waiting up to {wait:.0f}s for the turn to end in: "
+                    + ", ".join(s.label for s in pending.values())
                 )
             self.sleep(1.0)
-        return closed
 
-    def _close(
-        self, session: PlannedSession, closed: list[PlannedSession], report: RestartReport
-    ) -> bool:
-        """SIGTERM, then SIGKILL after ``close_timeout_seconds``. True once
-        the session is gone; a session that cannot be closed is left
-        running and reported."""
-        if not pid_matches_record(session.pid, session.proc_start):
-            report.exited.append(session)
-            return False
-        try:
-            if session.terminal is not None and session.terminal.kind == "tmux" and session.shell_pid is None:
-                # Its pane's own process: keep the pane when it exits, to
-                # respawn it.
-                self.terminals["tmux"].keep_pane(session.terminal)
-            self.kill(session.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        except (TerminalError, PermissionError) as e:
-            self._leave_running(session, str(e), report)
-            return False
-        if not self._wait_gone(session.pid, self.settings.close_timeout_seconds):
+    def _close_batch(
+        self,
+        sessions: Sequence[PlannedSession],
+        report: RestartReport,
+        closed: list[PlannedSession],
+        *,
+        mid_turn: bool = False,
+    ) -> None:
+        """SIGTERM every session at once, SIGKILL whichever is still up after
+        ``close_timeout_seconds``. A session that will not go is left
+        running and reported, its tmux pane as it was."""
+        signalled: list[PlannedSession] = []
+        for session in sessions:
+            if not pid_matches_record(session.pid, session.proc_start):
+                report.exited.append(session)
+                continue
+            try:
+                if self._is_pane_process(session):
+                    # Keep the pane when its process exits, to respawn it.
+                    self.terminals["tmux"].keep_pane(session.terminal)
+                self.kill(session.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except (TerminalError, PermissionError) as e:
+                self._leave_running(session, str(e), report)
+                continue
+            # On its way down: from here on it is reopened, even if this
+            # restart is cut short before it is gone.
+            signalled.append(session)
+            closed.append(session)
+        if not signalled:
+            return
+        self._wait_gone(signalled, self.settings.close_timeout_seconds)
+        stubborn = [s for s in signalled if is_pid_alive(s.pid)]
+        for session in stubborn:
             try:
                 self.kill(session.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            if not self._wait_gone(session.pid, _KILL_WAIT_S):
+        if stubborn:
+            self._wait_gone(stubborn, _KILL_WAIT_S)
+        for session in signalled:
+            if is_pid_alive(session.pid):
+                closed.remove(session)
                 self._leave_running(session, "it did not exit after SIGKILL", report)
-                return False
-        closed.append(session)
-        self._save_state(session, "closed")
-        self.progress(f"Closed {session.label}")
-        return True
+                continue
+            if mid_turn:
+                report.interrupted.append(session)
+            self._save_state(session, "closed")
+            self._say(f"Closed {session.label}")
+
+    def _is_pane_process(self, session: PlannedSession) -> bool:
+        return (
+            session.terminal is not None
+            and session.terminal.kind == "tmux"
+            and session.shell_pid is None
+        )
 
     def _leave_running(self, session: PlannedSession, reason: str, report: RestartReport) -> None:
+        if self._is_pane_process(session):
+            try:
+                self.terminals["tmux"].release_pane(session.terminal)
+            except TerminalError as e:
+                _logger.warning("Could not restore %s: %s", session.terminal.describe(), e)
         report.skipped.append(
             SkippedSession(session.pid, session.session_id, session.name, reason)
         )
-        self.progress(f"Leaving {session.label} running: {reason}")
+        self._say(f"Leaving {session.label} running: {reason}")
 
-    def _wait_gone(self, pid: int, timeout: float) -> bool:
+    def _wait_gone(self, sessions: Sequence[PlannedSession], timeout: float) -> None:
         deadline = self.clock() + timeout
-        while is_pid_alive(pid):
-            if self.clock() >= deadline:
-                return False
+        while any(is_pid_alive(s.pid) for s in sessions) and self.clock() < deadline:
             self.sleep(_POLL_S)
-        return True
 
     # -- reopen ---------------------------------------------------------------
 
     def _reopen_all(
         self, sessions: Sequence[PlannedSession], report: RestartReport
     ) -> None:
+        # A restart cut short reopens sessions it signalled and never saw
+        # go: give them their exit, and never start a second copy of one
+        # that is still up.
+        going = [
+            s
+            for s in sessions
+            if s.kind == "interactive"
+            and is_pid_alive(s.pid)
+            and pid_matches_record(s.pid, s.proc_start)
+        ]
+        if going:
+            self._wait_gone(going, self.settings.close_timeout_seconds)
+            still = [s for s in going if is_pid_alive(s.pid)]
+            for session in still:
+                self._leave_running(session, "it was still running", report)
+            sessions = [s for s in sessions if s not in still]
         launched: list[PlannedSession] = []
-        for session in sessions:
+        for i, session in enumerate(sessions):
+            if i:
+                # A fleet starting at once — each claude with its MCP
+                # servers — loads the machine; spread it out.
+                self.sleep(self.settings.reopen_stagger_seconds)
             try:
                 where = self._launch(session)
             except TerminalError as e:
                 report.failed.append((session, str(e)))
                 self._save_state(session, "failed")
-                self.progress(f"Could not reopen {session.label}: {e}")
+                self._say(f"Could not reopen {session.label}: {e}")
             else:
                 report.reopened_in[session.key] = where
                 launched.append(session)
@@ -1561,7 +1693,7 @@ class SessionRestarter:
                     report.reopened.append(session)
                     self._save_state(session, "reopened")
                     where = report.reopened_in.get(session.key)
-                    self.progress(f"Reopened {session.label} as pid {record.pid} in {where}")
+                    self._say(f"Reopened {session.label} as pid {record.pid} in {where}")
             if not waiting or self.clock() >= deadline:
                 break
             self.sleep(_POLL_S)
@@ -1573,7 +1705,7 @@ class SessionRestarter:
             )
             report.failed.append((session, reason))
             self._save_state(session, "failed")
-            self.progress(f"Could not confirm {session.label} reopened: {reason}")
+            self._say(f"Could not confirm {session.label} reopened: {reason}")
 
     # -- plan file ------------------------------------------------------------
 
@@ -1620,6 +1752,7 @@ class SessionRestarter:
             return self._reopen_unfinished()
 
     def _reopen_unfinished(self) -> RestartReport:
+        self.refresh_settings()
         report = RestartReport()
         data = read_plan_file(self.plan_path)
         live = {r.session_id for r in scan_sessions(self.claude_dir)[0]}
@@ -1657,15 +1790,14 @@ def restarter_for(
     enabled: bool | None = None,
     close_busy: bool = False,
     progress: Callable[[str], None] | None = None,
-) -> SessionRestarter | None:
-    """The restarter the ``restart`` settings ask for, or None when switches
-    leave sessions alone. ``enabled`` overrides ``restart.onSwitch``."""
-    settings = load_restart_settings(backup_dir)
-    if not (settings.on_switch if enabled is None else enabled):
-        return None
+) -> SessionRestarter:
+    """The restarter a switcher installs as ``around_switch``. It reads the
+    ``restart`` settings at every switch and does nothing while
+    ``restart.onSwitch`` is off; ``enabled`` overrides that setting."""
     return SessionRestarter(
         backup_dir / STATE_DIRNAME,
-        settings,
+        load_settings=lambda: load_restart_settings(backup_dir),
+        enabled=enabled,
         close_busy=close_busy,
         progress=progress,
     )

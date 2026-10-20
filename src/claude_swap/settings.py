@@ -120,6 +120,8 @@ class RestartSettings:
     # How long a reopened session has to write its record before it is
     # reported as not started.
     reopen_timeout_seconds: float = 60.0
+    # Seconds between reopening one session and the next.
+    reopen_stagger_seconds: float = 0.5
     # Where a session reopens when its own terminal cannot take it back (an
     # editor's terminal, Ghostty, Warp, a closed tab): "terminal" (a new
     # Terminal.app window), "iterm" (iTerm2), "tmux" (a tmux session named
@@ -250,6 +252,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "restart", "reopenTimeoutSeconds", "reopen_timeout_seconds", "float", 5.0, 600.0,
             help="Wait this long for each reopened session to start",
+        ),
+        SettingSpec(
+            "restart", "reopenStaggerSeconds", "reopen_stagger_seconds", "float", 0.0, 10.0,
+            help="Wait this long between reopening one session and the next",
         ),
         SettingSpec(
             "restart", "fallback", "fallback", "choice",

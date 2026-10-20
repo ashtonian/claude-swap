@@ -861,7 +861,7 @@ Defaults live in settings.json in the backup root; flags override them.
             switcher.around_switch = restarter_for(
                 switcher.backup_dir,
                 enabled=args.restart,
-                progress=None if args.json else _restart_progress(False),
+                progress=None if args.json else _restart_progress(False, stamped=True),
             )
         engine = AutoSwitchEngine(
             switcher,
@@ -1149,25 +1149,33 @@ def _menubar_service(args) -> int:
     return 0
 
 
-def _restart_progress(json_mode: bool):
+def _restart_progress(json_mode: bool, *, stamped: bool = False):
     """Progress lines for a restarting switch: dimmed on stdout, or on
-    stderr in JSON mode so stdout stays one JSON document."""
+    stderr in JSON mode so stdout stays one JSON document. ``stamped``
+    prefixes the time, as `cswap auto` does its own lines."""
+    import time as _time
 
     def emit(line: str) -> None:
+        if stamped:
+            line = f"{_time.strftime('%H:%M:%S')}  {line}"
         print(dimmed(line), file=sys.stderr if json_mode else sys.stdout, flush=True)
 
     return emit
 
 
 def _install_restart(switcher: ClaudeAccountSwitcher, args):
-    """Install the session restart the settings and flags ask for on
-    ``switcher``; returns it, or None when this switch leaves sessions
-    alone."""
+    """Install the session restart on ``switcher``: the settings decide
+    whether it runs, ``--restart``/``--no-restart`` override them, and
+    ``--close-busy`` asks for one. Returns the restarter (None only where
+    tests turn restarts off)."""
     from claude_swap.relaunch import restarter_for
 
+    enabled = args.restart
+    if enabled is None and args.close_busy:
+        enabled = True
     restarter = restarter_for(
         switcher.backup_dir,
-        enabled=args.restart,
+        enabled=enabled,
         close_busy=args.close_busy,
         progress=_restart_progress(args.json),
     )
@@ -1175,14 +1183,16 @@ def _install_restart(switcher: ClaudeAccountSwitcher, args):
     return restarter
 
 
-def _detach_restart(restarter, args) -> bool:
+def _detach_restart(switcher: ClaudeAccountSwitcher, restarter, args) -> bool:
     """Run the switch in a detached worker when this command runs inside a
     session the switch would close: closing it would end this process
     halfway. True when the worker took over and this command is done.
 
     The worker re-runs the same command line, waits for this process to
     exit (the session then finishes its turn, and is closed and reopened
-    with the rest), and posts a macOS notification when done.
+    with the rest), and posts a macOS notification when done. The target
+    is resolved here first: the worker has no terminal to report a bad one
+    in, or to ask which of two accounts an email means.
     """
     from claude_swap.relaunch import (
         WORKER_LOG_FILENAME,
@@ -1193,11 +1203,16 @@ def _detach_restart(restarter, args) -> bool:
     if os.environ.get(WORKER_ENV):
         wait_for_launcher(timeout=60.0)
         return False
+    if not restarter.enabled_now():
+        return False
     hosting = restarter.plan().hosting
     if not hosting:
         return False
+    argv = list(sys.argv[1:])
+    if args.switch_to:
+        argv = _with_target(argv, args.switch_to, switcher.resolve_account(args.switch_to)[0])
     log_path = restarter.state_dir / WORKER_LOG_FILENAME
-    pid = spawn_worker(sys.argv[1:], log_path)
+    pid = spawn_worker(argv, log_path)
     message = (
         f"This command runs inside {hosting[0].label}, which the switch "
         f"restarts, so it continues in the background (pid {pid}): it waits "
@@ -1225,17 +1240,33 @@ def _detach_restart(restarter, args) -> bool:
     return True
 
 
+def _with_target(argv: list[str], identifier: str, number: str) -> list[str]:
+    """``argv`` with the switch target ``identifier`` (``switch X``,
+    ``--switch-to X`` or ``--switch-to=X``) replaced by its account number."""
+    out = list(argv)
+    for i, token in enumerate(out):
+        if token == identifier:
+            out[i] = number
+            return out
+        if token.startswith("--switch-to=") and token.partition("=")[2] == identifier:
+            out[i] = f"--switch-to={number}"
+            return out
+    return out
+
+
 def _notify_restart_done(switcher: ClaudeAccountSwitcher, restarter) -> None:
-    """A detached worker's closing notification."""
-    current = switcher.current_account_number()
-    email = switcher.account_email(current) if current else ""
+    """A detached worker's closing notification. No report means the
+    switch never ran (the target was already active)."""
     from claude_swap.relaunch import restart_summary
 
+    current = switcher.current_account_number()
+    email = switcher.account_email(current) if current else ""
+    account = f"Account-{current} ({email})" if current else "the current account"
     report = restarter.last_report
-    detail = f"Account-{current} ({email})" if current else "the switch is done"
-    if report is not None:
-        detail += f" · {restart_summary(report.to_json())}"
-    notify("claude-swap: switched", detail)
+    if report is None:
+        notify("claude-swap: no switch", f"{account} is already active")
+    else:
+        notify("claude-swap: switched", f"{account} · {restart_summary(report.to_json())}")
 
 
 def _sessions_command(argv: list[str]) -> None:
@@ -1815,7 +1846,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         restarter = None
         if args.switch or args.switch_to:
             restarter = _install_restart(switcher, args)
-            if restarter is not None and _detach_restart(restarter, args):
+            if restarter is not None and _detach_restart(switcher, restarter, args):
                 return
 
         if args.add_account:
@@ -1863,10 +1894,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             payload = switcher.switch_to(
                 args.switch_to, json_output=args.json, force=args.force
             )
-        if restarter is not None and restarter.last_report is not None and not args.json:
+        report = restarter.last_report if restarter is not None else None
+        if report is not None and (report.reopened or report.failed) and not args.json:
             from claude_swap.relaunch import restart_summary
 
-            print(dimmed(f"Claude Code sessions: {restart_summary(restarter.last_report.to_json())}"))
+            print(dimmed(f"Claude Code sessions: {restart_summary(report.to_json())}"))
         if restarter is not None and os.environ.get(WORKER_ENV):
             _notify_restart_done(switcher, restarter)
         elif args.status:
@@ -1904,9 +1936,13 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             from claude_swap.menubar import run as menubar_run
 
             sys.exit(menubar_run(switcher))
-    except ClaudeSwitchError as e:
+    except Exception as e:
+        # A detached worker has nobody watching its output: whatever ends
+        # it says so on screen.
         if os.environ.get(WORKER_ENV) and (args.switch or args.switch_to):
-            notify("claude-swap: switch failed", str(e))
+            notify("claude-swap: switch failed", f"{e} (see the restart worker log)")
+        if not isinstance(e, ClaudeSwitchError):
+            raise
         # In JSON mode keep stdout pure JSON: emit the structured error envelope
         # there (exit 1) instead of a red stderr line.
         if args.json:
@@ -1915,6 +1951,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
+        if os.environ.get(WORKER_ENV) and (args.switch or args.switch_to):
+            notify("claude-swap: switch interrupted", "Closed sessions were reopened; `cswap reopen` retries any that were not")
         # Route the cancellation note to stderr in JSON mode so stdout stays
         # parseable (the guarantee covers completion / handled errors, not Ctrl-C).
         print(

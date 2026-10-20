@@ -59,6 +59,7 @@ class TestConfigList:
             "restart.continueInterrupted",
             "restart.closeTimeoutSeconds",
             "restart.reopenTimeoutSeconds",
+            "restart.reopenStaggerSeconds",
             "restart.fallback",
             "ui.theme",
         ):

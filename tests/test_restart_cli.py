@@ -47,6 +47,9 @@ class FakeRestarter:
     def plan(self) -> RestartPlan:
         return self._plan
 
+    def enabled_now(self) -> bool:
+        return True
+
     def __call__(self, switch):
         return switch()
 
@@ -58,6 +61,7 @@ def _main(argv: list[str]):
          patch("claude_swap.update_check.check_for_update", return_value=None):
         switcher_cls.return_value.current_account_number.return_value = "2"
         switcher_cls.return_value.account_email.return_value = "b@example.com"
+        switcher_cls.return_value.resolve_account.return_value = ("2", "b@example.com", "")
         cli.main()
     return switcher_cls.return_value
 
@@ -147,6 +151,57 @@ class TestDetach:
         assert notes == [
             ("claude-swap: switched", "Account-2 (b@example.com) · reopened 1 of 1 session(s)")
         ]
+
+
+class TestWorkerTarget:
+    @pytest.mark.parametrize(
+        ("argv", "expected"),
+        [
+            (["switch", "dev"], ["switch", "2"]),
+            (["--switch-to", "dev", "--json"], ["--switch-to", "2", "--json"]),
+            (["--switch-to=dev"], ["--switch-to=2"]),
+        ],
+    )
+    def test_the_worker_gets_the_account_number(self, argv, expected):
+        assert cli._with_target(argv, "dev", "2") == expected
+
+    def test_an_alias_is_resolved_before_handing_over(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(relaunch.WORKER_ENV, raising=False)
+        plan = RestartPlan(sessions=(), skipped=(), hosting=(SESSION,), unreadable=0)
+        restarter = FakeRestarter(tmp_path / "relaunch", plan)
+        spawned = []
+        with patch("claude_swap.relaunch.restarter_for", lambda *a, **k: restarter), \
+             patch("claude_swap.relaunch.spawn_worker",
+                   lambda argv, log: spawned.append(list(argv)) or 1):
+            _main(["switch", "dev"])
+        assert spawned == [["switch", "2"]]
+
+    def test_an_unexpected_worker_failure_is_announced(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(relaunch.WORKER_ENV, "1")
+        monkeypatch.setattr(relaunch, "wait_for_launcher", lambda timeout: None)
+        plan = RestartPlan(sessions=(), skipped=(), hosting=(), unreadable=0)
+        restarter = FakeRestarter(tmp_path / "relaunch", plan)
+        notes = []
+        with patch("claude_swap.relaunch.restarter_for", lambda *a, **k: restarter), \
+             patch("claude_swap.cli.notify", lambda title, msg: notes.append(title)), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "switch", "2"]), \
+             patch("os.geteuid", return_value=1000, create=True):
+            switcher_cls.return_value.switch_to.side_effect = RuntimeError("boom")
+            with pytest.raises(RuntimeError):
+                cli.main()
+        assert notes == ["claude-swap: switch failed"]
+
+    def test_close_busy_asks_for_a_restart(self):
+        seen = {}
+
+        def restarter_for(backup_dir, **kwargs):
+            seen.update(kwargs)
+            return None
+
+        with patch("claude_swap.relaunch.restarter_for", restarter_for):
+            _main(["switch", "2", "--close-busy"])
+        assert seen["enabled"] is True and seen["close_busy"] is True
 
 
 class TestSessionsCommand:
